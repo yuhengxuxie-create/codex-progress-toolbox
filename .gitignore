@@ -1,0 +1,12 @@
+config.local.json
+config.local.json.*.bak
+.state/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+htmlcov/
+.coverage
+.venv/
+dist/
+*.zip
+SHA256SUMS.txt

@@ -1,0 +1,6 @@
+[project]
+name = "codex-progress-notify"
+version = "1.2.0"
+description = "Codex thread management and completion notifications for Feishu and webhooks"
+requires-python = ">=3.11"
+dependencies = []
