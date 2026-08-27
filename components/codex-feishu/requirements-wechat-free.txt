@@ -1,0 +1,2 @@
+# Apache-2.0；只提供 Windows UI Automation 客户端，不包含微信注入或商业授权。
+uiautomation==2.0.29

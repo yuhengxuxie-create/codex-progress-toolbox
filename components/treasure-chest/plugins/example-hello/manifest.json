@@ -1,0 +1,21 @@
+{
+  "id": "example-hello",
+  "name": "示例：问候工具",
+  "version": "1.0.0",
+  "sdk": "1",
+  "author": "TreasureChest",
+  "description": "用于验证插件扫描和工具贡献；默认停用。",
+  "enabled_by_default": false,
+  "contributions": {
+    "tools": [
+      {
+        "id": "say-hello",
+        "name": "插件示例：你好",
+        "entry": "hello.ps1",
+        "working_directory": ".",
+        "category": "示例插件"
+      }
+    ],
+    "sessions": []
+  }
+}

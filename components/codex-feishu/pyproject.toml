@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "progress-checking-wx"
+version = "1.5.0"
+description = "Codex 对话进度的本地飞书通知与双向回复桥"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "ProgressChecking(WX) contributors"}]
+dependencies = [
+    "PyYAML>=6.0.2,<7",
+    # 仅用于连接本机 Codex app-server；Apache-2.0，体积小且完整处理分片/ping/UTF-8。
+    "websocket-client>=1.8.0,<2",
+]
+
+[project.scripts]
+progress-wx = "progress_wx.cli:main"
+progress-notify = "progress_wx.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

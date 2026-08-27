@@ -1,0 +1,33 @@
+# Local production configuration and secrets
+/config.yaml
+/config.yaml.*.bak
+/.state/
+/.secrets/
+
+# Bundled runtime and generated package metadata
+/Python313-ProgressWX/
+*.egg-info/
+
+# Runtime output
+/logs/
+*.log
+*.pid
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Python/test caches
+__pycache__/
+*.py[cod]
+/.pytest_cache/
+/.coverage
+/htmlcov/
+
+# Build and editor output
+/build/
+/dist/
+/.idea/
+/.vscode/
+
+# Git metadata is intentionally stored here via --separate-git-dir.
+/gits/

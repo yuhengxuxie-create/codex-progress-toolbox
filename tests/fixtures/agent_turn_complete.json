@@ -1,8 +1,0 @@
-{
-  "type": "agent-turn-complete",
-  "thread-id": "thr_selected",
-  "turn-id": "turn_456",
-  "cwd": "workspace/demo",
-  "input-messages": ["请完成实现并验证。"],
-  "last-assistant-message": "实现和自动化测试已经完成，需要你在真实沙箱中执行一次人工验收。"
-}

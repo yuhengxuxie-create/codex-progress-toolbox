@@ -1,0 +1,68 @@
+# “Codex管理（飞书）”配置模板。首次安装会复制为 config.yaml，请只修改副本。
+version: 2
+
+codex:
+  # 留空时默认使用当前用户的 ~/.codex；可通过 CODEX_HOME 统一迁移。
+  home: "${CODEX_HOME:-~/.codex}"
+  # 通过“新建项目”创建的本地项目统一放在这里；显示名与文件夹名保持一致。
+  managed_project_root: "${USERPROFILE}/Documents/Codex/Projects"
+  # Windows 若“codex”命中 Microsoft Store 的 Desktop EXE，请改为官方 CLI
+  # 的 codex.cmd/codex.ps1 绝对路径；共享网关会从其 npm 包树精确解析 native CLI。
+  command: "codex"
+  # 默认使用 Codex Desktop 官方任务工具管道；不重启 Desktop，也不触碰代理、路由或 TUN。
+  # stdio/shared_websocket 只为旧部署兼容保留；日常使用不推荐。
+  reply_transport: "desktop_app_tools"
+  desktop_log_dir: "${LOCALAPPDATA}/Codex/Logs"
+  # 共享网关只允许绑定 IPv4 回环；第二次确认后用子进程专用环境启动 Desktop。
+  shared_websocket_url: "ws://127.0.0.1:6230"
+  gateway_pid_file: ".state/codex-gateway.pid"
+  shared_desktop_state_file: ".state/codex-shared-desktop.json"
+  # 手机端远程回复投递及兼容 app-server 轮次最长等待 24 小时。
+  reply_timeout_seconds: 86400
+
+monitor:
+  # 三类选择器均为“精确匹配”，不会进行模糊或关键词匹配。
+  ids:
+    - "请替换为 Codex 对话 ID"
+  titles: []
+  paths: []
+
+messaging:
+  backend: "feishu"
+  # 会话正文只允许回复本工具发出的消息；未引用消息仅接受代码声明的精确管理入口。
+  require_quote: true
+  secret_file: ".secrets/hmac.key"
+  pending_ttl_hours: 72
+
+feishu:
+  app_id: "${FEISHU_APP_ID:-}"
+  # App Secret 必须通过配置命令写入 DPAPI，不得明文填写在 YAML 中。
+  app_secret_file: ".secrets/feishu-app-secret.dpapi"
+  target_open_id: "${FEISHU_TARGET_OPEN_ID:-}"
+  connect_timeout_seconds: 30
+
+service:
+  poll_seconds: 2
+  # 失败最多尝试五次，间隔递增；耗尽后警报并停止全部操作。
+  max_attempts: 5
+  retry_delays: [1, 2, 4, 8, 16]
+  log_retention_days: 7
+  database: ".state/progress-wx.sqlite"
+  log_dir: "logs"
+  pid_file: ".state/progress-wx.pid"
+
+summary:
+  # codex_cli 复用已登录的 Codex CLI；分类模型独立于主任务模型。
+  # 只在正常结束/人工输入这类需要语义判断的事件调用；失败、打断、审批直接本地映射。
+  # 子进程强制临时、只读、忽略用户规则，并移除 API Key 环境变量，避免改写主任务或切到 API 计费。
+  # codex_final 不产生额外额度，但正常结束无法可靠区分“完成”与“仍在进行”。
+  mode: "codex_cli"
+  codex_command: "codex"
+  reasoning_effort: "low"
+  timeout_seconds: 120
+  # 保留较长最终答复中的主要成果，供离开电脑时生成自包含进度报告。
+  max_input_chars: 12000
+  endpoint: "https://api.openai.com/v1"
+  model: "gpt-5.6-luna"
+  api_key_env: "OPENAI_API_KEY"
+  min_interval_seconds: 0

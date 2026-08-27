@@ -1,12 +1,60 @@
 # Changelog
 
-## 1.2.0 - 2026-08-26
+## v1.5.0 - 2026-08-27
 
-- Added native Feishu custom-bot text delivery and optional signature verification.
-- Added a no-echo Feishu configuration wizard.
-- Added Codex-guided first-install instructions through repository `AGENTS.md`.
-- Added the Chinese thread manager and local title-index fallback from the tested build.
-- Replaced machine-specific runtime defaults with `%LOCALAPPDATA%`.
-- Added repository licensing, security, contribution, and privacy guidance.
-- Hardened the public package boundary to exclude local configuration and private
-  remote-server deployment material.
+### 整体架构
+
+- 从“单向完成通知脚本”升级为“Codex 管理 + 进度监测 + 百宝箱”三件套生态。
+- 飞书通道由群自定义机器人 Webhook 升级为企业自建应用机器人，通过官方 WebSocket 长连接接收消息，通过官方 API 主动发送；无需公网回调服务器或电脑飞书客户端。
+- Codex 管理与进度监测在同一安全后台内运行，百宝箱通过稳定 CLI/JSON 契约调用后台，不直接复制业务规则或改写 YAML。
+
+### Codex 管理（飞书）
+
+- 新增项目列表、个人会话列表、稳定分页快照和历史消息复用；项目/会话标号与被回复的飞书 message_id 精确绑定，避免串线。
+- 支持从飞书新建项目、新建项目会话、新建个人会话、选定并继续已有 Codex 会话。
+- 支持双向图片：手机图片与文字可在同一富文本中转交；纯图片可短时暂存后与下一条文字合并；Codex 生成图以飞书图片消息直接预览，并绑定原会话继续回复。
+- 选定含图会话时会随概览发送最近一轮原图；上传前不转码、不压缩。
+- 新增“等待用户选择”结构化通知，任务进入 `waitingOnUserInput` 时立即提醒，不需要等 `/goal` 暂停或结算，也不调用摘要模型。
+- 新增用户全局 PermissionRequest 飞书审批：支持“允许一次”“拒绝”；只有 Codex 明确给出可复用 `prefix_rule` 时才提供“允许类似操作”，并先经 `codex execpolicy check` 验证后写入独立规则文件。
+- 新增首轮命令“查询剩余额度”，通过官方 App Server `account/rateLimits/read` 读取，只显示 Codex 每周可用百分比与剩余重置卡数量，不展示 Spark，不使用缓存估算。
+- 每条普通工作进度通知末尾自动附加相同的额度摘要；额度接口临时失败不阻断主进度通知。
+- 新增飞书漫画课堂版使用说明（6 张 Q 版图片）和文字版使用说明 v1.5.0；发送“使用说明”默认发课堂图片，文字版按需发送。
+- 入站命令、引用回复、表单、图片和审批全部按唯一 open_id 白名单、message_id、签名上下文与幂等键校验。
+
+### Codex 进度监测
+
+- 从仅处理正常完成事件，升级为结合 Codex notify、Codex Desktop 官方任务工具和只读结构化 SQLite 状态，可靠识别完成、失败、打断、待审批、待用户输入等状态。
+- 新增自动发现与统一监测注册表：手动项永久保留，自动项 24 小时无活动后自然到期；用户明确移除会写抑制记录，避免自动立即恢复。
+- 新增稳定 CLI：`monitor-list`、`monitor-add`、`monitor-remove`、`monitor-settings`，JSON stdout 保持纯净并带 `schema_version=1`。
+- 新增自动监测热开关：关闭后停止自动发现/续期，不删除已有 auto 项，已有项按原到期时间自然退出；manual 项不受影响。
+- 进度摘要改为优先保留清楚的原回复；短回复直接使用，长回复只做删减式凝练，避免把大白话改成机器化报告。
+- 新增通知持久化去重、消息分片绑定、即时回执、图片失败隔离、有限重试、崩溃恢复和日志保留策略。
+- 使用 Codex Desktop 官方 `list_threads`、`wait_threads`、`send_message_to_thread` 等能力，不接管桌面会话，不修改代理、路由、DNS 或 TUN。
+
+### 百宝箱
+
+- 会话管理页上方升级为六列“项目监测列表”：会话名称、项目/个人归属、来源、最后活动时间、剩余有效时间、完整任务 ID。
+- 支持刷新、批量手动添加、批量明确移除、在 Codex 中打开任务，并按项目/个人来源分组展示。
+- 新增“监测设置”界面，可真实开启/关闭自动监测；通过 `monitor-settings` CLI 热生效，不直接编辑 FeiShuBOT 配置。
+- 由旧 YAML 直写服务和旧双栏管理器迁移到集中 `ProjectMonitorCliService` 适配器；兼容 numeric Unix 秒/毫秒和 ISO-8601 时间。
+- 修复带空格 Python 路径经 `cmd /c` 启动失败的问题，改用安全 `call "python.exe" ...` 调用。
+- 保留后台服务管理、托盘单实例、插件中心、工具启动、开机自启与有限自动重启功能。
+- 当前百宝箱生产只读联调已验证六列字段完整、UI 无接口错误；v1.5.0 发布构建要求 0 warning/0 error 且全部自测通过。
+
+### 安全与可靠性
+
+- 飞书 App Secret 使用 DPAPI 保存，不写入 YAML、命令行、日志或分享包。
+- 分享包排除真实 `config.yaml/config.json`、`.secrets`、`.state`、logs、数据库、DPAPI 文件、open_id、App ID、用户名、本机绝对路径、缓存、运行时状态和私人截图。
+- Python/飞书依赖使用固定版本与 SHA-256；离线 Python 安装器必须验证 Python Software Foundation 数字签名。
+- 所有安装、升级、卸载脚本必须备份现有 Codex notify/hooks，并能精确回滚本工具自己的改动，不覆盖其他工具配置。
+
+### 破坏性变更与迁移说明
+
+- GitHub v1.2.0 的“飞书自定义机器人 Webhook”不能直接作为 v1.5.0 企业自建应用机器人的 App ID/App Secret 使用。升级向导明确要求用户新建或选择企业自建应用、开通最小权限并重新绑定 open_id。
+- v1.2.0 的 `config.local.json`/环境变量不能直接覆盖新版 `config.yaml`。升级器只迁移可验证的 thread-id 监测列表，其他旧配置完整备份并保留。
+- 从 2026-08-25 生态包升级时，保留用户的 `config.yaml`、`.secrets`、`.state`、监测数据库和百宝箱 `config.json`，让状态库按程序 schema 正常迁移；模板配置不覆盖生产配置。
+- 升级先停止旧服务、建立带时间戳备份、验证新包、执行迁移、启动并健康检查；失败时自动回滚文件和原 notify/hooks，不得留下半升级状态。
+
+## v1.2.0 - 2026-08-26
+
+旧公开基线：群自定义机器人 Webhook、`agent-turn-complete` 四行通知、手选 thread-id 和可选外部摘要。该版本不包含双向飞书管理、企业自建应用、全局审批、额度查询或 TreasureChest。保留旧 Release 仅用于审计和升级来源识别。

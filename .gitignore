@@ -1,12 +1,33 @@
-config.local.json
-config.local.json.*.bak
-.state/
-__pycache__/
-*.py[cod]
-.pytest_cache/
-htmlcov/
-.coverage
-.venv/
-dist/
-*.zip
-SHA256SUMS.txt
+# Release-only binary payloads and generated assets
+/payload/
+/artifacts/
+/release-local/
+/*.zip
+/SHA256SUMS.txt
+
+# Private/runtime state
+**/config.yaml
+**/config.yaml.*.bak
+**/config.local.json
+**/config.json
+**/.secrets/
+**/.state/
+**/logs/
+**/*.dpapi
+**/*.key
+**/*.db
+**/*.sqlite
+**/*.sqlite3
+**/*.log
+
+# Build and cache output
+**/.dotnet/
+**/bin/
+**/obj/
+**/build/
+**/dist/
+**/exports/
+**/__pycache__/
+**/.pytest_cache/
+**/*.egg-info/
+**/*.py[cod]

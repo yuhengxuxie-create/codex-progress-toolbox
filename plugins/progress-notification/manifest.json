@@ -1,0 +1,28 @@
+{
+  "id": "progress-notification",
+  "name": "飞书进度通知联动工具",
+  "version": "1.5.0",
+  "sdk": "1",
+  "author": "TreasureChest Project",
+  "description": "为 Codex Feishu Ecosystem 提供企业自建应用首次设置和本地操作手册入口。",
+  "enabled_by_default": true,
+  "contributions": {
+    "tools": [
+      {
+        "id": "first-setup",
+        "name": "飞书进度通知首次设置",
+        "entry": "setup.cmd",
+        "working_directory": ".",
+        "category": "进度通知"
+      },
+      {
+        "id": "open-guide",
+        "name": "打开完整部署与使用攻略",
+        "entry": "open-guide.cmd",
+        "working_directory": ".",
+        "category": "帮助文档"
+      }
+    ],
+    "sessions": []
+  }
+}
