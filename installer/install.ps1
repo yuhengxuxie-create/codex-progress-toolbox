@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$InstallRoot = '',
     [switch]$NonInteractive,
@@ -32,11 +32,16 @@ if (Test-Path -LiteralPath $InstallRoot) {
 
 $Transaction = New-EcosystemTransaction -InstallRoot $InstallRoot -Kind install -CodexHomePath $CodexHomePath
 try {
+    Update-TransactionManifest -ManifestPath $Transaction.ManifestPath -Changes @{ runtime_ready = $false }
     Install-EcosystemFiles -PackageRoot $PackageRoot -InstallRoot $InstallRoot
     $Python = Install-PythonRuntime -PackageRoot $PackageRoot -InstallRoot $InstallRoot -SkipRuntimeInstall:$SkipRuntimeInstall -RuntimeSeedPython $RuntimeSeedPython
+    if (-not $SkipRuntimeInstall) { Update-TransactionManifest -ManifestPath $Transaction.ManifestPath -Changes @{ runtime_ready = $true } }
     $Config = Initialize-EcosystemConfig -InstallRoot $InstallRoot
     if (-not $SkipCodexIntegration) { Install-CodexIntegration -InstallRoot $InstallRoot -PythonExe $Python }
     Test-EcosystemHealth -InstallRoot $InstallRoot -PythonExe $Python -SkipRuntimeCheck:$SkipRuntimeInstall
+    if (-not $SkipRuntimeInstall -and $null -ne (Get-InstalledGuardianStatus -InstallRoot $InstallRoot)) {
+        & (Join-Path $PSScriptRoot 'guardian-task.ps1') -Mode Install -InstallRoot $InstallRoot
+    }
 
     $Metadata = [ordered]@{
         schema_version = 1
@@ -66,7 +71,7 @@ try {
     Write-Host "事务备份：$($Transaction.ManifestPath)"
 } catch {
     $Failure = $_
-    try { Restore-EcosystemTransaction -ManifestPath $Transaction.ManifestPath } catch { Write-Warning "自动回滚失败：$($_.Exception.Message)" }
+    try { Restore-EcosystemTransaction -ManifestPath $Transaction.ManifestPath -AutomaticFailure } catch { Write-Warning "自动回滚失败：$($_.Exception.Message)" }
     throw $Failure
 }
 

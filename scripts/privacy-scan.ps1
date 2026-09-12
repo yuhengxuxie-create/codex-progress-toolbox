@@ -1,11 +1,14 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
-    [string]$Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path,
+    [string]$Root = '',
     [string]$SensitiveYaml = ''
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+if ([string]::IsNullOrWhiteSpace($Root)) {
+    $Root = Join-Path $PSScriptRoot '..'
+}
 $Root = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $Root).Path).TrimEnd('\')
 $IsPackage = Test-Path -LiteralPath (Join-Path $Root 'PACKAGE_TYPE.txt') -PathType Leaf
 $Violations = New-Object System.Collections.Generic.List[string]
@@ -61,8 +64,11 @@ foreach ($File in Get-ChildItem -LiteralPath $Root -Recurse -File -Force | Where
 }) {
     $Relative = $File.FullName.Substring($Root.Length).TrimStart('\')
     $Text = Get-Content -LiteralPath $File.FullName -Raw -ErrorAction Stop
+    # 该身份仅作为公开开源仓库地址的一部分出现，不是用户凭据或本机私人数据。
+    $IdentityText = $Text.Replace('https://github.com/yuhengxuxie-create/codex-progress-toolbox', '').Replace(
+        'https://api.github.com/repos/yuhengxuxie-create/codex-progress-toolbox', '')
     foreach ($Needle in $Needles | Select-Object -Unique) {
-        if ($Text.IndexOf($Needle, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        if ($IdentityText.IndexOf($Needle, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
             $Violations.Add("known-private-identity`t$Relative")
             break
         }

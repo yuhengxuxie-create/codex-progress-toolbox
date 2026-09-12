@@ -19,7 +19,7 @@ from .installer import (
     _normalized_command,
     _previous_notify_wrapper,
 )
-from .state import StateStore
+from .state import enqueue_hook_payload_only
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -160,15 +160,11 @@ def enqueue(raw_argument: str, config_path: Path = DEFAULT_CONFIG_PATH) -> bool:
         if not isinstance(payload, dict):
             raise ValueError("根节点不是对象")
         config = load_config(config_path)
-        store = StateStore(config.service.database)
-        try:
-            # ``INSERT OR IGNORE`` 会把 Codex 重试送达的同一轮当作幂等成功；
-            # 即使本次没有新增行，也不能让 notify 看到失败码并误以为入队失败。
-            # 真正的 JSON、配置或协议错误仍会由异常路径返回 False。
-            store.enqueue_hook_payload(payload)
-            return True
-        finally:
-            store.close()
+        # Hook 是 Codex 完成事件的短命热路径，只能向服务已初始化的旧表追加；
+        # 绝不允许它因为开发工作树中的 SCHEMA_VERSION 改动而提前迁移生产库。
+        # ``INSERT OR IGNORE`` 把 Codex 对同一轮的重试视为幂等成功。
+        enqueue_hook_payload_only(config.service.database, payload)
+        return True
     except Exception as exc:
         _record_error(f"事件入队失败：{type(exc).__name__}: {exc}")
         return False

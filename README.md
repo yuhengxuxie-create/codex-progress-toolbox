@@ -1,46 +1,34 @@
-# Codex Feishu Ecosystem
+# Codex 飞书生态
 
-一套面向 Windows 的完整开源生态：飞书端 Codex 管理、Codex 进度监测，以及配套桌面软件“百宝箱”。当前整体版本为 **v1.5.0**。
+面向 Windows 的飞书任务管理与进度通知工具，配套桌面应用“百宝箱”。本目录对应 **v1.6.0** 正式版本。
 
-v1.5.0 将旧 v1.2.0 Webhook 通知脚本升级为完整生态，且配置架构不兼容。飞书端改用企业自建应用机器人和官方 WebSocket 长连接；用户必须创建自己的应用，发布包不含任何开发者账号、App ID、App Secret、open_id、任务 ID、日志或本机路径。
+## 本版本包含什么
 
-## 三个组成部分
+- 飞书功能中心：创建和查询任务、搜索会话、引用消息继续图文对话，以及 Goal、Plan 等指令使用。
+- 直接问题的答案、可审阅成果、重要变化、待操作和任务完成通知；图片与成果文件独立回传，保留历史关联和去重状态。
+- Codex 额度重置消息预警与记录。预警不代表个人账户额度已经重置；来源故障会显示覆盖不完整。
+- 百宝箱任务监测、工具与插件管理、主题设置、预警已读记录和整套生态更新。
+- 四页图解使用说明、完整文字说明，以及旧用户飞书卡片回调和底部菜单设置指引。
 
-- **Codex 管理**：从飞书查看项目与个人会话、新建或继续任务、双向传图、等待用户选择提醒、用户级权限审批和额度查询。
-- **Codex 进度监测**：识别完成、失败、打断、待审批、待用户输入，自动发现任务并提供稳定 `monitor-*` CLI。
-- **TreasureChest 百宝箱**：桌面服务管理、六列项目监测列表、批量添加/移除、在 Codex 中打开任务、自动监测设置、插件中心与托盘管理。
+## 安装与首次升级
 
-## 下载与安装
+从 [GitHub Releases](https://github.com/yuhengxuxie-create/codex-progress-toolbox/releases) 下载对应完整安装包或升级包。自动生成的 Source code ZIP 不含运行载荷。
 
-1. 在 GitHub Releases 下载 **`codex-feishu-ecosystem-v1.5.0-full.zip`**。不要把 GitHub 自动生成的 `Source code (zip)` 当作完整安装包；它不含自包含百宝箱、Python 安装器和离线依赖。
-2. 校验 Release 页面和 `SHA256SUMS.txt` 中的 SHA-256。
-3. 解压到长期稳定、非系统目录。
-4. 使用 Codex 打开整个解压目录，并说：“请按照 AGENTS.md 安装并引导我创建飞书机器人。”
+新用户选 full 包，解压后用 Codex 打开目录并说“按照 AGENTS.md 安装并引导配置飞书”。先校验 SHA256SUMS.txt 和包内文件，再安装并输入凭据。App Secret 只能在本机隐藏输入窗口填写，不要发送到聊天。
 
-Codex 会先校验安装包，再完成不含凭据的基础安装，然后一次一步引导创建企业自建应用。App Secret 只在本机无回显窗口输入，绝不能粘贴进聊天。
+**已有 v1.5.0 用户首次升级须下载 upgrade-from-v1.x 包**，解压到旧安装目录之外，双击根目录“快捷升级.cmd”，选择旧安装目录，按 [升级说明](UPGRADE.md) 完成操作。不要寻找旧版没有的内置更新按钮，也不要仅替换 EXE。以后可通过新版百宝箱“设置 → 生态更新”检查正式更新。
 
-## 升级
+保留原机器人、配置和绑定，不必重新配对。权限 scope 没有新增；卡片操作需要补充回调，底部菜单需要相应事件和菜单项。按 [飞书升级设置](docs/FEISHU_UPGRADE_PERMISSIONS.md) 完成配置。
 
-- GitHub v1.2.0 单体模板或 2026-08-25 旧完整生态用户，请下载 **`codex-feishu-ecosystem-v1.5.0-upgrade-from-v1.x.zip`**。
-- 旧 Webhook 不能作为新版 App ID/App Secret；`config.local.json` 也不能覆盖新版 YAML。
-- 升级器会先停止旧服务、建立时间戳备份、迁移或保留允许的数据、验证并健康检查；失败会自动回滚。
+## 使用说明
 
-详情见 [UPGRADE.md](UPGRADE.md)。
+- [飞书文字指南](components/codex-feishu/docs/FEISHU_USAGE.md)
+- [图文使用入口与最新变化](docs/USAGE_CURRENT.md)
+- [百宝箱指南](components/treasure-chest/README.md)
+- [升级、备份和回滚](UPGRADE.md)
+- [通信守护与 Windows 自动恢复](docs/WINDOWS_GUARDIAN_RECOVERY.md)
+- [安全说明](SECURITY.md)
 
-## 源码结构
-
-```text
-components/codex-feishu/     Codex 管理与进度监测后台
-components/treasure-chest/   TreasureChest 桌面应用
-installer/                   安装、升级、回滚、校验、卸载
-docs/                        飞书设置、日常使用、架构和故障处理
-scripts/                     可重复构建、隐私扫描和 E2E
-```
-
-源码仓库不提交 Python 安装器、wheel 缓存、`.NET bin/obj` 或生成的 EXE。完整二进制载荷只存在于 GitHub Release 附件。
-
-## 安全
-
-安装器不会修改代理、路由、DNS、TUN 或 VPN。它只对本工具的 Codex `notify` 和 `PermissionRequest` Hook 做可验证、可回滚的修改，并在变更前备份。安全报告见 [SECURITY.md](SECURITY.md)。
+源码位于 components/codex-feishu 和 components/treasure-chest；installer 包含安装和回滚脚本，scripts 包含构建与验证工具。公开包不包含生产配置、凭据、数据库、日志或用户内容。自动测试不等于真实飞书手机界面和账号授权验收。
 
 许可证：[MIT](LICENSE)。

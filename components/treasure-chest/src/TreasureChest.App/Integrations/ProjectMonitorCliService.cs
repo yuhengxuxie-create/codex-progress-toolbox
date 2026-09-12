@@ -24,7 +24,7 @@ public sealed record ProjectMonitorSettings(
 /// <summary>
 /// FeiShuBOT 项目监测 CLI 的唯一适配入口。监测来源、过期和抑制规则均由 FeiShuBOT 负责。
 /// </summary>
-public sealed class ProjectMonitorCliService
+public sealed partial class ProjectMonitorCliService
 {
     public const int SupportedSchemaVersion = 1;
     private static readonly Regex ThreadIdPattern = new(

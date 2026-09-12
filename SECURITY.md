@@ -26,3 +26,8 @@
 ## 报告漏洞
 
 请通过 GitHub Security Advisory 私密报告。不要在公开 Issue 中附带 Secret、open_id、任务 ID、日志、配置、对话截图或数据库。若凭据疑似泄露，先在飞书开放平台轮换 Secret，再继续排查。
+
+
+## 1.6.0 候选配置增量
+
+权限 scope 与 v1.5.0 相同。卡片按钮和表单需要 card.action.trigger 回调；底部菜单需要 application.bot.menu_v6 事件及准确菜单键。详见本包 docs/FEISHU_UPGRADE_PERMISSIONS.md。凭据不进入分发包，旧用户不重新配对。

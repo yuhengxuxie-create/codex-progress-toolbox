@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param([Parameter(Mandatory = $true)][string]$PackageRoot, [string]$RuntimeSeedPython = '')
 
 $ErrorActionPreference = 'Stop'
@@ -50,6 +50,9 @@ try {
     if ($Version -ne '3.13.14') { throw "临时 Python 版本异常：$Version" }
 
     $ProgressRoot = Join-Path $InstallRoot 'components\codex-feishu'
+    # PS5 converts redirected native stderr into an ErrorRecord. These commands
+    # intentionally reject an unconfigured installation; inspect exit codes.
+    $ErrorActionPreference = 'Continue'
     & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ProgressRoot 'scripts\status.ps1') -ToolsRoot (Join-Path $InstallRoot 'components') *> $null
     if ($LASTEXITCODE -notin @(0, 1)) { throw '临时 status 失败。' }
     & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ProgressRoot 'scripts\start.ps1') -ToolsRoot (Join-Path $InstallRoot 'components') *> $null
@@ -59,6 +62,7 @@ try {
     }
     & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ProgressRoot 'scripts\stop.ps1') -ToolsRoot (Join-Path $InstallRoot 'components') *> $null
     if ($LASTEXITCODE -notin @(0, 1)) { throw '临时 stop 失败。' }
+    $ErrorActionPreference = 'Stop'
 
     $Metadata = Get-Content -LiteralPath (Join-Path $InstallRoot '.ecosystem\installation.json') -Raw | ConvertFrom-Json
     & (Join-Path $PackageRoot 'installer\rollback.ps1') -TransactionManifest ([string]$Metadata.transaction_manifest)

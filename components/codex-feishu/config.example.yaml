@@ -66,3 +66,12 @@ summary:
   model: "gpt-5.6-luna"
   api_key_env: "OPENAI_API_KEY"
   min_interval_seconds: 0
+
+reset_alert:
+  # 每天北京时间 08:00～23:00 整点检查；首次启用只建立基线，不倒灌历史告警。
+  enabled: true
+  # 四个公开来源分别失败隔离；来源地址固定在代码中，避免配置被用作任意网络请求。
+  request_timeout_seconds: 15
+  # 预测站只能作为候选与概率信号，达到阈值后仍需独立官方额度证据。
+  forecast_threshold: 70
+  max_candidate_posts: 40

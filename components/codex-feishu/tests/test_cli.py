@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from argparse import Namespace
 import hashlib
+import io
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,9 +11,11 @@ import pytest
 import yaml
 
 from progress_wx import cli
+from progress_wx.codex_store import ThreadRecord, thread_title_recovery_hash
 from progress_wx.config import ConfigError, load_config
 from progress_wx.retry import RetryExhausted
 from progress_wx.state import StateStore
+from progress_wx.state import CorrelationCodec
 
 
 def _gateway_config(tmp_path: Path) -> SimpleNamespace:
@@ -24,6 +27,55 @@ def _gateway_config(tmp_path: Path) -> SimpleNamespace:
             shared_websocket_url="ws://127.0.0.1:6230",
         ),
     )
+
+
+def test_resolve_uncertain_accepts_legacy_parent_code_when_one_child_exists(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    codec = CorrelationCodec(b"u" * 32)
+    database = tmp_path / "state.sqlite"
+    store = StateStore(database)
+    from progress_wx.models import TurnEvent
+
+    event = TurnEvent("thread-1", "turn-1", "completed")
+    code = codec.issue()
+    store.reserve_notification(event, code, "通知", 72)
+    store.mark_sent(event.dedupe_key)
+    delivery = store.enqueue_turn_reply(
+        code,
+        "message-1",
+        "fingerprint-1",
+        codec,
+        reply_text="继续",
+    )
+    assert delivery is not None
+    assert store.claim_turn_reply(delivery.delivery_id) is True
+    store.close()
+
+    config = SimpleNamespace(
+        service=SimpleNamespace(database=database, pid_file=tmp_path / "service.pid"),
+        messaging=SimpleNamespace(secret_file=tmp_path / "correlation.key"),
+    )
+    monkeypatch.setattr(cli, "_config", lambda _args, ready=False: config)
+    monkeypatch.setattr(cli, "instance_running", lambda _path: False)
+    monkeypatch.setattr(
+        cli.CorrelationCodec,
+        "from_file",
+        classmethod(lambda cls, _path: codec),
+    )
+
+    assert cli._resolve_uncertain(Namespace(code=code, outcome="not-delivered")) == 0
+    assert "下次启动会重新排队一次" in capsys.readouterr().out
+    reopened = StateStore(database)
+    assert reopened.pending_turn_replies() == [
+        (
+            delivery.delivery_id,
+            "thread-1",
+            "继续",
+            "fingerprint-1",
+        )
+    ]
+    reopened.close()
 
 
 def test_gateway_start_requires_caller_owned_launch_token() -> None:
@@ -325,16 +377,24 @@ def test_monitor_cli_json_contract_add_list_remove(
 ) -> None:
     database = tmp_path / "state.sqlite"
     config = SimpleNamespace(codex=SimpleNamespace(home=tmp_path))
-    record = SimpleNamespace(
+    record = ThreadRecord(
         thread_id="thread-1",
         title="飞书机器人开发",
         preview="",
         updated_at_ms=1_700_000_000_000,
         created_at_ms=None,
+        thread_source="user",
+        raw={"name": "飞书机器人开发", "preview": ""},
+        title_source="manual_name",
     )
 
-    def runtime(_args):
-        return config, StateStore(database), None, {"thread-1": record}
+    def runtime(_args, *, read_only=False):
+        store = (
+            StateStore(database, mode="ro", migrate=False)
+            if read_only
+            else StateStore(database)
+        )
+        return config, store, None, {"thread-1": record}
 
     monkeypatch.setattr(cli, "_monitor_runtime", runtime)
     monkeypatch.setattr(
@@ -360,6 +420,7 @@ def test_monitor_cli_json_contract_add_list_remove(
         {
             "thread_id": "thread-1",
             "title": "飞书机器人开发",
+            "title_origin": "codex_manual",
             "group": "FeiShuBOT",
             "project": "FeiShuBOT",
             "origin": "manual",
@@ -377,10 +438,62 @@ def test_monitor_cli_json_contract_add_list_remove(
     assert json.loads(capsys.readouterr().out) == {"schema_version": 1, "items": []}
 
 
+def test_list_threads_filters_subagents_and_uses_hash_bound_recovery(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    database = tmp_path / "state.sqlite"
+    prompt = "请完成一个历史工具的分析、修复、验证和说明。" * 8
+    damaged = ThreadRecord(
+        "thread-user",
+        title=prompt,
+        preview=prompt,
+        thread_source="user",
+        updated_at_ms=1_700_000_000_000,
+        raw={"title": prompt, "name": "", "preview": prompt},
+        title_source="prompt_fallback",
+    )
+    internal = ThreadRecord(
+        "thread-subagent",
+        title="内部子任务",
+        thread_source="subagent",
+    )
+    state = StateStore(database)
+    state.put_thread_title_recovery(
+        thread_id=damaged.thread_id,
+        content_hash=thread_title_recovery_hash(damaged),
+        display_title="修复历史自动化工具",
+    )
+    state.close()
+
+    class FakeCatalog:
+        def select_threads(self, *, include_archived=False):
+            assert include_archived is True
+            return [damaged, internal]
+
+        def require_readable(self, _operation):
+            return self
+
+    config = SimpleNamespace(
+        codex=SimpleNamespace(home=tmp_path),
+        service=SimpleNamespace(database=database),
+    )
+    monkeypatch.setattr(cli, "_config", lambda _args, ready=False: config)
+    monkeypatch.setattr(cli, "CodexStore", lambda **_kwargs: FakeCatalog())
+    monkeypatch.setattr(cli, "_desktop_project_assignments", lambda _home: {})
+
+    assert cli._list_threads(Namespace(json=True)) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert len(payload) == 1
+    assert payload[0]["id"] == "thread-user"
+    assert payload[0]["title"] == "修复历史自动化工具"
+    assert payload[0]["title_origin"] == "recovered_summary"
+
+
 def test_monitor_settings_cli_json_contract(monkeypatch, tmp_path: Path, capsys) -> None:
     database = tmp_path / "state.sqlite"
     config = SimpleNamespace(service=SimpleNamespace(database=database))
     monkeypatch.setattr(cli, "_config", lambda _args, ready=False: config)
+    StateStore(database).close()
 
     assert cli._monitor_settings(Namespace(auto_enabled=None, json=True)) == 0
     assert json.loads(capsys.readouterr().out) == {
@@ -481,7 +594,7 @@ def test_test_feishu_retries_each_operation_five_times_and_reuses_idempotency_ke
             target_open_id="ou_target",
             connect_timeout_seconds=1.0,
         ),
-        service=SimpleNamespace(max_attempts=5, retry_delays=(0, 0, 0, 0, 0)),
+        service=SimpleNamespace(max_attempts=5, retry_delays=(0, 0, 0, 0, 0),database=tmp_path/'state.sqlite',pid_file=tmp_path/'worker.pid'),
     )
     monkeypatch.setattr(cli, "_config", lambda _args: config)
     monkeypatch.setattr(cli.DpapiSecretStore, "load", lambda _self: "secret")
@@ -540,7 +653,7 @@ def test_test_feishu_usage_guide_sends_preview_images_then_hint(
             target_open_id="ou_target",
             connect_timeout_seconds=1.0,
         ),
-        service=SimpleNamespace(max_attempts=1, retry_delays=(0,)),
+        service=SimpleNamespace(max_attempts=1, retry_delays=(0,),database=tmp_path/'state.sqlite',pid_file=tmp_path/'worker.pid'),
     )
     monkeypatch.setattr(cli, "_config", lambda _args: config)
     monkeypatch.setattr(cli.DpapiSecretStore, "load", lambda _self: "secret")
@@ -574,7 +687,7 @@ def test_test_feishu_usage_guide_sends_preview_images_then_hint(
 
     assert cli._test_feishu(Namespace(text="ignored", usage_guide=True)) == 0
     assert [item[0] for item in texts] == [
-        "以上为使用说明，如果想要文字版使用说明，请发送“文字版使用说明”哦"
+        "以上为使用说明，如果想要文字版使用说明，请发送“.文字版使用说明”哦"
     ]
     assert texts[0][1].endswith(":usage-footer")
     assert [item[0] for item in images] == [b"one", b"two"]
@@ -600,7 +713,7 @@ def test_test_feishu_stops_after_retry_exhaustion(monkeypatch, tmp_path: Path) -
             target_open_id="ou_target",
             connect_timeout_seconds=1.0,
         ),
-        service=SimpleNamespace(max_attempts=5, retry_delays=(0, 0, 0, 0, 0)),
+        service=SimpleNamespace(max_attempts=5, retry_delays=(0, 0, 0, 0, 0),database=tmp_path/'state.sqlite',pid_file=tmp_path/'worker.pid'),
     )
     monkeypatch.setattr(cli, "_config", lambda _args: config)
     monkeypatch.setattr(cli.DpapiSecretStore, "load", lambda _self: "secret")
@@ -938,3 +1051,311 @@ def test_baseline_selected_terminal_turns_is_idempotent() -> None:
 
     assert cli._baseline_selected_terminal_turns((old_event, new_event), Store()) == 1
     assert marked == [new_event.dedupe_key]
+
+
+def _session_search_cli_config(tmp_path: Path):
+    return SimpleNamespace(
+        service=SimpleNamespace(
+            database=tmp_path / "state.sqlite",
+            max_attempts=5,
+            retry_delays=(0, 0, 0, 0, 0),
+        ),
+        codex=SimpleNamespace(
+            home=tmp_path / "codex-home",
+            command="codex",
+            managed_project_root=tmp_path / "projects",
+        ),
+        summary=SimpleNamespace(codex_command="codex"),
+    )
+
+
+def test_session_search_cli_reads_utf8_request_file_and_outputs_one_json_object(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    request_file = tmp_path / "request.json"
+    request_file.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "name": "记错的标题",
+                "description": "真实语义线索",
+                "last_activity": "这几天",
+                "scope": "auto",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    progress_file = tmp_path / "progress.json"
+    observed = {}
+
+    class Engine:
+        def search(self, request, *, progress, cancel_file):
+            observed["request"] = request
+            observed["cancel_file"] = cancel_file
+            progress.write("completed", 1, 1, "搜索完成")
+            return SimpleNamespace(
+                to_dict=lambda: {
+                    "schema_version": 1,
+                    "search_id": "search-1",
+                    "status": "not_found",
+                    "scope": "recent_30d",
+                    "can_expand": True,
+                    "next_scope": "recent_180d",
+                    "cost_warning": "预计少量额度",
+                    "matches": [],
+                }
+            )
+
+    monkeypatch.setattr(cli, "_config", lambda _args: _session_search_cli_config(tmp_path))
+    monkeypatch.setattr(cli, "CodexStore", lambda _home: "codex-store")
+    monkeypatch.setattr(cli, "CodexProjectRegistry", lambda *_args: "registry")
+    monkeypatch.setattr(cli, "build_session_search_engine", lambda **_kwargs: Engine())
+    args = Namespace(
+        request_file=str(request_file),
+        progress_file=progress_file,
+        cancel_file=tmp_path / "cancel",
+        json=True,
+    )
+    assert cli._session_search(args) == 0
+    stdout = capsys.readouterr().out
+    assert stdout.count("\n") == 1
+    assert json.loads(stdout)["search_id"] == "search-1"
+    assert observed["request"].semantic_clues == ("记错的标题", "真实语义线索", "这几天")
+    assert observed["cancel_file"] == args.cancel_file
+    assert json.loads(progress_file.read_text(encoding="utf-8")) == {
+        "schema_version": 1,
+        "phase": "completed",
+        "current": 1,
+        "total": 1,
+        "message": "【生产持久缓存】搜索完成",
+    }
+
+
+def test_session_search_ephemeral_mode_never_mutates_production_state(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    request_file = tmp_path / "request.json"
+    request_file.write_text(
+        '{"schema_version":1,"description":"合成验收线索"}',
+        encoding="utf-8",
+    )
+    config = _session_search_cli_config(tmp_path)
+    production = StateStore(config.service.database)
+    production.put_session_search_cache(
+        thread_id="thread-existing",
+        content_hash="a" * 64,
+        latest_turn_id="turn-existing",
+        description="已有描述",
+        evidence={"source": "production"},
+        last_result="已有结果",
+        last_activity_at=1_000,
+        now=1_000,
+    )
+    production.close()
+    before = hashlib.sha256(Path(config.service.database).read_bytes()).hexdigest()
+    observed = {}
+
+    class Engine:
+        def __init__(self, isolated_state: StateStore):
+            self.state = isolated_state
+
+        def search(self, _request, *, progress, cancel_file):
+            assert cancel_file is None
+            assert self.state.session_search_cache(
+                "thread-existing", "a" * 64
+            ) is not None
+            self.state.put_session_search_cache(
+                thread_id="thread-isolated",
+                content_hash="b" * 64,
+                latest_turn_id="turn-isolated",
+                description="仅隔离库",
+                evidence={"source": "ephemeral"},
+                last_result="隔离结果",
+                last_activity_at=2_000,
+                now=2_000,
+            )
+            progress.write("completed", 1, 1, "搜索完成")
+            return SimpleNamespace(
+                to_dict=lambda: {
+                    "schema_version": 1,
+                    "search_id": "isolated",
+                    "status": "not_found",
+                    "scope": "recent_30d",
+                    "can_expand": True,
+                    "next_scope": "recent_180d",
+                    "cost_warning": "",
+                    "matches": [],
+                }
+            )
+
+    def build_engine(**kwargs):
+        isolated_state = kwargs["state"]
+        observed["isolated_path"] = Path(
+            isolated_state._connection.execute("PRAGMA database_list").fetchone()[2]
+        )
+        return Engine(isolated_state)
+
+    monkeypatch.setattr(cli, "_config", lambda _args: config)
+    monkeypatch.setattr(cli, "CodexStore", lambda _home: "codex-store")
+    monkeypatch.setattr(cli, "CodexProjectRegistry", lambda *_args: "registry")
+    monkeypatch.setattr(cli, "build_session_search_engine", build_engine)
+    progress_file = tmp_path / "progress.json"
+    args = Namespace(
+        request_file=str(request_file),
+        progress_file=progress_file,
+        cancel_file=None,
+        cache_mode="ephemeral",
+        json=True,
+    )
+
+    assert cli._session_search(args) == 0
+    assert json.loads(capsys.readouterr().out)["search_id"] == "isolated"
+    assert hashlib.sha256(Path(config.service.database).read_bytes()).hexdigest() == before
+    reopened = StateStore(config.service.database)
+    assert reopened.session_search_cache("thread-existing", "a" * 64) is not None
+    assert reopened.session_search_cache("thread-isolated", "b" * 64) is None
+    reopened.close()
+    assert not observed["isolated_path"].exists()
+    assert json.loads(progress_file.read_text(encoding="utf-8"))["message"] == (
+        "【隔离临时缓存】搜索完成"
+    )
+
+
+def test_session_search_cli_accepts_stdin_and_returns_exit_three_on_cancel(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    class Engine:
+        def search(self, _request, *, progress, cancel_file):
+            assert cancel_file == tmp_path / "cancel"
+            raise cli.SessionSearchCancelled("调用方已取消")
+
+    monkeypatch.setattr(cli, "_config", lambda _args: _session_search_cli_config(tmp_path))
+    monkeypatch.setattr(cli, "CodexStore", lambda _home: "codex-store")
+    monkeypatch.setattr(cli, "CodexProjectRegistry", lambda *_args: "registry")
+    monkeypatch.setattr(cli, "build_session_search_engine", lambda **_kwargs: Engine())
+    monkeypatch.setattr(
+        cli.sys,
+        "stdin",
+        SimpleNamespace(read=lambda _limit: '{"schema_version":1,"description":"线索"}'),
+    )
+    progress_file = tmp_path / "progress.json"
+    args = Namespace(
+        request_file="-",
+        progress_file=progress_file,
+        cancel_file=tmp_path / "cancel",
+        json=True,
+    )
+    assert cli._session_search(args) == 3
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "调用方已取消" in captured.err
+    assert json.loads(progress_file.read_text(encoding="utf-8"))["phase"] == "cancelled"
+
+
+def test_session_search_cli_decodes_utf8_binary_stdin_without_windows_codepage(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    observed = {}
+
+    class Engine:
+        def search(self, request, *, progress, cancel_file):
+            del cancel_file
+            observed["description"] = request.description
+            progress.write("completed", 0, 0, "完成")
+            return SimpleNamespace(
+                to_dict=lambda: {
+                    "schema_version": 1,
+                    "search_id": "utf8",
+                    "status": "not_found",
+                    "scope": "recent_30d",
+                    "can_expand": True,
+                    "next_scope": "recent_180d",
+                    "cost_warning": "",
+                    "matches": [],
+                }
+            )
+
+    class BinaryOnlyStdin:
+        def __init__(self, data):
+            self.buffer = io.BytesIO(data)
+
+        def read(self, _limit):
+            raise AssertionError("存在 buffer 时不得经过环境文本代码页")
+
+    request = json.dumps(
+        {"schema_version": 1, "description": "查了查我现在的剩余额度"},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    monkeypatch.setattr(cli.sys, "stdin", BinaryOnlyStdin(request))
+    monkeypatch.setattr(cli, "_config", lambda _args: _session_search_cli_config(tmp_path))
+    monkeypatch.setattr(cli, "CodexStore", lambda _home: "codex-store")
+    monkeypatch.setattr(cli, "CodexProjectRegistry", lambda *_args: "registry")
+    monkeypatch.setattr(cli, "build_session_search_engine", lambda **_kwargs: Engine())
+    args = Namespace(
+        request_file="-",
+        progress_file=tmp_path / "progress.json",
+        cancel_file=None,
+        json=True,
+    )
+    assert cli._session_search(args) == 0
+    assert observed["description"] == "查了查我现在的剩余额度"
+    assert json.loads(capsys.readouterr().out)["search_id"] == "utf8"
+
+
+def test_session_search_cli_rejects_unknown_request_field_before_loading_config(
+    monkeypatch, tmp_path: Path
+) -> None:
+    request_file = tmp_path / "request.json"
+    request_file.write_text('{"schema_version":1,"secret_query":"no"}', encoding="utf-8")
+    monkeypatch.setattr(
+        cli,
+        "_config",
+        lambda _args: (_ for _ in ()).throw(AssertionError("无效请求不得加载生产配置")),
+    )
+    args = Namespace(
+        request_file=str(request_file),
+        progress_file=tmp_path / "progress.json",
+        cancel_file=None,
+        json=True,
+    )
+    with pytest.raises(ConfigError, match="未知字段"):
+        cli._session_search(args)
+    assert json.loads(args.progress_file.read_text(encoding="utf-8"))["phase"] == "failed"
+
+
+def test_session_search_cli_parser_requires_request_and_progress_files() -> None:
+    parsed = cli._parser().parse_args(
+        [
+            "session-search",
+            "--request-file",
+            "request.json",
+            "--progress-file",
+            "progress.json",
+            "--cancel-file",
+            "cancel.flag",
+            "--json",
+        ]
+    )
+    assert parsed.command == "session-search"
+    assert str(parsed.request_file) == "request.json"
+    assert parsed.progress_file == Path("progress.json")
+    assert parsed.cancel_file == Path("cancel.flag")
+    assert parsed.cache_mode == "persistent"
+    assert parsed.json is True
+
+
+def test_session_search_cli_parser_accepts_ephemeral_cache_mode() -> None:
+    parsed = cli._parser().parse_args(
+        [
+            "session-search",
+            "--request-file",
+            "request.json",
+            "--progress-file",
+            "progress.json",
+            "--cache-mode",
+            "ephemeral",
+        ]
+    )
+
+    assert parsed.cache_mode == "ephemeral"

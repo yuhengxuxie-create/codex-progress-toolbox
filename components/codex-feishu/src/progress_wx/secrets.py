@@ -205,6 +205,7 @@ def _tighten_acl_with_icacls(path: Path) -> None:
             encoding="mbcs",
             errors="replace",
             shell=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, UnicodeError) as exc:
         raise SecretStoreError("调用 icacls 收紧密钥文件 ACL 失败") from exc

@@ -16,6 +16,7 @@ from pathlib import Path
 import queue
 import shlex
 import shutil
+import stat
 import subprocess
 import threading
 import time
@@ -24,11 +25,20 @@ from types import MappingProxyType
 from typing import Any, TextIO
 from urllib.parse import urlsplit
 
+from .codex_app_tools import (
+    DesktopAppToolsClient,
+    DesktopAppToolsError,
+    default_codex_desktop_log_dir,
+)
 from .codex_store import ThreadStatus
 
 
 class CodexRPCError(RuntimeError):
     """App Server 启动、JSON-RPC 或协议错误。"""
+
+
+class CodexRPCRejected(CodexRPCError):
+    """App Server 已明确返回 JSON-RPC error。"""
 
 
 class CodexRPCTimeout(CodexRPCError):
@@ -136,6 +146,37 @@ class ServerRequest:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class ServerNotification:
+    """App Server 发出的普通 JSON-RPC 通知。
+
+    ``turn/completed`` 和需要客户端回答的 server request 仍走原有专用
+    队列；这里只保留调用方明确需要核验的状态通知，例如
+    ``thread/settings/updated`` 和 ``skills/changed``。
+    """
+
+    method: str
+    params: Mapping[str, Any]
+    raw: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    @classmethod
+    def from_message(cls, message: Mapping[str, Any]) -> "ServerNotification | None":
+        method = message.get("method")
+        params = message.get("params")
+        if (
+            not isinstance(method, str)
+            or not method.strip()
+            or "id" in message
+            or not isinstance(params, Mapping)
+        ):
+            return None
+        return cls(
+            method=method.strip(),
+            params=MappingProxyType(dict(params)),
+            raw=MappingProxyType(dict(message)),
+        )
+
+
 _EOF = object()
 
 
@@ -163,6 +204,83 @@ def _status_from_wire(value: str) -> ThreadStatus:
         "in-progress": ThreadStatus.IN_PROGRESS,
     }
     return aliases.get(value.strip().casefold(), ThreadStatus.UNKNOWN)
+
+
+def _trusted_desktop_codex_executable(path: object, root: Path) -> Path | None:
+    """只接受 Desktop 私有 bin/<版本目录>/codex.exe 的普通文件。
+
+    目录名由 Desktop 管理，调用方不得猜测或写死；同时拒绝链接、重解析点、
+    更深层路径与根目录外的 PATH 劫持结果。
+    """
+
+    try:
+        candidate = Path(os.fspath(path)).resolve(strict=True)
+        trusted_root = root.resolve(strict=True)
+        relative = candidate.relative_to(trusted_root)
+        candidate_stat = candidate.stat()
+        parent_stat = candidate.parent.stat()
+    except (OSError, TypeError, ValueError):
+        return None
+    if (
+        candidate.name.casefold() != "codex.exe"
+        or len(relative.parts) != 2
+        or not stat.S_ISREG(candidate_stat.st_mode)
+        or candidate.is_symlink()
+        or candidate.parent.is_symlink()
+    ):
+        return None
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if (
+        int(getattr(candidate_stat, "st_file_attributes", 0)) & reparse
+        or int(getattr(parent_stat, "st_file_attributes", 0)) & reparse
+    ):
+        return None
+    return candidate
+
+
+def discover_desktop_codex_command(
+    configured: str | Sequence[str] = "codex",
+    *,
+    local_app_data: str | os.PathLike[str] | None = None,
+    desktop_cli_path: str | os.PathLike[str] | None = None,
+    windows: bool | None = None,
+) -> str | Sequence[str]:
+    """为远程控制发现当前 Codex Desktop 自带 CLI。
+
+    Windows 上绝不回退到可能陈旧的独立 ``codex-cli`` 配置，也不按目录数或
+    mtime 猜版本。路径必须来自已验明的当前 Desktop 工具管道对应日志；随后
+    再执行可信根、层级和重解析点校验。非 Windows 保留显式配置。
+    ``desktop_cli_path`` 仅是合成测试注入口，生产调用不提供它。
+    """
+
+    is_windows = os.name == "nt" if windows is None else bool(windows)
+    if not is_windows:
+        return configured
+    raw_base = (
+        os.fspath(local_app_data)
+        if local_app_data is not None
+        else os.environ.get("LOCALAPPDATA")
+    )
+    if not raw_base or not str(raw_base).strip():
+        raise CodexRPCError("无法定位 Codex Desktop 本地程序目录，指令使用已禁用")
+    base = Path(raw_base)
+    root = base / "OpenAI" / "Codex" / "bin"
+    authoritative = desktop_cli_path
+    if authoritative is None:
+        try:
+            authoritative = DesktopAppToolsClient(
+                default_codex_desktop_log_dir()
+            ).discover_current_codex_cli()
+        except DesktopAppToolsError as exc:
+            raise CodexRPCError(
+                "无法从当前 Codex Desktop 运行身份确认 bundled CLI，指令使用已禁用"
+            ) from exc
+    trusted = _trusted_desktop_codex_executable(authoritative, root)
+    if trusted is None:
+        raise CodexRPCError(
+            "Codex Desktop 公布的 CLI 未通过可信路径校验，指令使用已禁用"
+        )
+    return os.fspath(trusted)
 
 
 def command_argv(command: str | Sequence[str] = "codex") -> list[str]:
@@ -261,6 +379,7 @@ class CodexAppServer:
         websocket_url: str | None = None,
         websocket_factory: Callable[..., Any] | None = None,
         on_turn_completed: Callable[[TurnCompletedEvent], None] | None = None,
+        experimental_api: bool = False,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds 必须大于 0")
@@ -279,11 +398,13 @@ class CodexAppServer:
         )
         self._websocket_factory = websocket_factory
         self._callback = on_turn_completed
+        self.experimental_api = bool(experimental_api)
         self._process: Any | None = None
         self._websocket: Any | None = None
         self._reader: threading.Thread | None = None
         self._incoming: queue.Queue[object] = queue.Queue()
         self._events: queue.Queue[object] = queue.Queue()
+        self._notifications: queue.Queue[object] = queue.Queue()
         self._next_id = 1
         self._write_lock = threading.Lock()
         self._request_lock = threading.Lock()
@@ -351,6 +472,7 @@ class CodexAppServer:
         self._closed.clear()
         self._incoming = queue.Queue()
         self._events = queue.Queue()
+        self._notifications = queue.Queue()
         self._reader = threading.Thread(
             target=self._read_stdout,
             name="progress-wx-codex-reader",
@@ -396,6 +518,7 @@ class CodexAppServer:
         self._closed.clear()
         self._incoming = queue.Queue()
         self._events = queue.Queue()
+        self._notifications = queue.Queue()
         self._reader = threading.Thread(
             target=self._read_websocket,
             name="progress-wx-codex-websocket-reader",
@@ -418,16 +541,16 @@ class CodexAppServer:
         else:
             self._start_websocket()
         try:
-            response = self._request(
-                "initialize",
-                {
-                    "clientInfo": {
-                        "name": self.client_name,
-                        "title": "进度通知",
-                        "version": self.client_version,
-                    }
-                },
-            )
+            initialize_params: dict[str, Any] = {
+                "clientInfo": {
+                    "name": self.client_name,
+                    "title": "进度通知",
+                    "version": self.client_version,
+                }
+            }
+            if self.experimental_api:
+                initialize_params["capabilities"] = {"experimentalApi": True}
+            response = self._request("initialize", initialize_params)
             if not isinstance(response.get("result"), Mapping):
                 raise CodexRPCError("Codex initialize 响应缺少 result")
             self._notify("initialized", {})
@@ -463,6 +586,7 @@ class CodexAppServer:
             self._reader = None
             self._incoming.put(_EOF)
             self._events.put(_EOF)
+            self._notifications.put(_EOF)
             return
         stdin = getattr(process, "stdin", None)
         if stdin is not None:
@@ -496,6 +620,7 @@ class CodexAppServer:
         # 如果伪造进程没有触发 EOF，主动唤醒等待者。
         self._incoming.put(_EOF)
         self._events.put(_EOF)
+        self._notifications.put(_EOF)
 
     def _read_stdout(self) -> None:
         process = self._process
@@ -503,6 +628,7 @@ class CodexAppServer:
         if stdout is None:
             self._incoming.put(_EOF)
             self._events.put(_EOF)
+            self._notifications.put(_EOF)
             return
         try:
             for raw_line in stdout:
@@ -532,6 +658,7 @@ class CodexAppServer:
         finally:
             self._incoming.put(_EOF)
             self._events.put(_EOF)
+            self._notifications.put(_EOF)
 
     def _read_websocket(self) -> None:
         connection = self._websocket
@@ -565,6 +692,7 @@ class CodexAppServer:
             self._closed.set()
             self._incoming.put(_EOF)
             self._events.put(_EOF)
+            self._notifications.put(_EOF)
 
     def _route_message(self, message: dict[str, Any]) -> None:
         """把两种传输收到的同一协议消息路由到有界业务入口。"""
@@ -583,6 +711,10 @@ class CodexAppServer:
         if server_request is not None:
             self._events.put(server_request)
             return
+        notification = ServerNotification.from_message(message)
+        if notification is not None:
+            self._notifications.put(notification)
+            return
         # 只有客户端请求的响应进入响应队列。普通通知不应在长轮次中积压。
         if "id" in message and "method" not in message:
             self._incoming.put(message)
@@ -596,13 +728,20 @@ class CodexAppServer:
         except (TypeError, ValueError) as exc:
             raise CodexRPCError("JSON-RPC 请求不可序列化") from exc
 
-    def _write(self, message: Mapping[str, Any]) -> None:
+    def _write(
+        self,
+        message: Mapping[str, Any],
+        *,
+        before_send: Callable[[], None] | None = None,
+    ) -> None:
         if self.websocket_url is not None:
             connection = self._websocket
             if connection is None or not self.is_running:
                 raise CodexRPCClosed("共享 Codex App Server 未连接")
             payload = self._json_line(message).rstrip("\n")
             with self._write_lock:
+                if before_send is not None:
+                    before_send()
                 try:
                     connection.send(payload)
                 except Exception as exc:
@@ -614,6 +753,8 @@ class CodexAppServer:
             raise CodexRPCClosed("Codex App Server 未运行")
         line = self._json_line(message)
         with self._write_lock:
+            if before_send is not None:
+                before_send()
             try:
                 stdin.write(line)
                 stdin.flush()
@@ -637,6 +778,7 @@ class CodexAppServer:
         *,
         timeout_seconds: float | None = None,
         on_server_request: Callable[[ServerRequest], None] | None = None,
+        before_send: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         if not self.is_running:
             raise CodexRPCClosed("Codex App Server 未启动")
@@ -653,7 +795,7 @@ class CodexAppServer:
             }
             if params is not None:
                 message["params"] = dict(params)
-            self._write(message)
+            self._write(message, before_send=before_send)
             deadline = time.monotonic() + timeout
             deferred: list[TurnCompletedEvent] = []
             try:
@@ -671,7 +813,9 @@ class CodexAppServer:
                             continue
                         error = item.get("error")
                         if error is not None:
-                            raise CodexRPCError(f"Codex App Server {method} 返回 JSON-RPC error")
+                            raise CodexRPCRejected(
+                                f"Codex App Server {method} 返回 JSON-RPC error"
+                            )
                         return item
 
                     try:
@@ -702,7 +846,9 @@ class CodexAppServer:
                         continue
                     error = item.get("error")
                     if error is not None:
-                        raise CodexRPCError(f"Codex App Server {method} 返回 JSON-RPC error")
+                        raise CodexRPCRejected(
+                            f"Codex App Server {method} 返回 JSON-RPC error"
+                        )
                     return item
             finally:
                 for deferred_event in deferred:
@@ -715,6 +861,7 @@ class CodexAppServer:
         *,
         timeout_seconds: float | None = None,
         on_server_request: Callable[[ServerRequest], None] | None = None,
+        before_send: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         """发送一个请求；首次使用时自动启动并握手。"""
 
@@ -724,7 +871,56 @@ class CodexAppServer:
             params,
             timeout_seconds=timeout_seconds,
             on_server_request=on_server_request,
+            before_send=before_send,
         )
+
+    def request_with_notification(
+        self,
+        method: str,
+        params: Mapping[str, Any] | None,
+        *,
+        notification_method: str,
+        notification_matches: Callable[[Mapping[str, Any]], bool],
+        timeout_seconds: float | None = None,
+        before_send: Callable[[], None] | None = None,
+    ) -> tuple[dict[str, Any], ServerNotification]:
+        """发送请求并等待一个可验证的同连接状态通知。
+
+        通知可能先于空响应到达，所以读取线程会先持久地放入本连接内存队列。
+        错方法、错线程等无关通知不会被误当成写后确认。调用方应把通知超时
+        视为提交后结果未知，而不是安全重试。
+        """
+
+        if not notification_method.strip():
+            raise ValueError("notification_method 不能为空")
+        timeout = self.timeout_seconds if timeout_seconds is None else float(timeout_seconds)
+        if timeout <= 0:
+            raise ValueError("timeout_seconds 必须大于 0")
+        response = self.request(
+            method,
+            params,
+            timeout_seconds=timeout,
+            before_send=before_send,
+        )
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CodexRPCTimeout(f"等待 {notification_method} 通知超时")
+            try:
+                item = self._notifications.get(timeout=min(0.05, remaining))
+            except queue.Empty:
+                continue
+            if item is _EOF:
+                raise CodexRPCClosed(
+                    f"Codex App Server 在等待 {notification_method} 时退出"
+                )
+            if (
+                isinstance(item, ServerNotification)
+                and item.method == notification_method
+                and notification_matches(item.params)
+            ):
+                return response, item
 
     def respond(self, request_id: str | int, result: Mapping[str, Any]) -> None:
         """在原连接上回答 Codex 发起的 JSON-RPC 请求；响应只写入一次。"""
@@ -806,6 +1002,42 @@ class CodexAppServer:
         return active[0] if active else ""
 
     @staticmethod
+    def thread_is_active(response: Mapping[str, Any]) -> bool:
+        """按官方 ``thread.status`` 与 turns 双重证据判断活动状态。"""
+
+        result = response.get("result")
+        thread = result.get("thread") if isinstance(result, Mapping) else None
+        if not isinstance(thread, Mapping):
+            raise CodexRPCError("thread/read 响应缺少 thread")
+        status = thread.get("status")
+        status_type = (
+            _first_text(status, "type")
+            if isinstance(status, Mapping)
+            else str(status or "")
+        ).casefold().replace("_", "")
+        if status_type in {"active", "inprogress", "running"}:
+            return True
+        if status_type and status_type not in {
+            "idle",
+            "notloaded",
+            "completed",
+            "failed",
+            "interrupted",
+            "cancelled",
+            "canceled",
+        }:
+            raise CodexRPCError("thread/read 返回未知 thread.status")
+        turns = thread.get("turns")
+        if not isinstance(turns, list):
+            raise CodexRPCError("thread/read 响应缺少 turns")
+        return any(
+            isinstance(turn, Mapping)
+            and _first_text(turn, "status").casefold().replace("_", "")
+            == "inprogress"
+            for turn in turns
+        )
+
+    @staticmethod
     def _normalize_input(value: Any) -> list[Any]:
         if isinstance(value, str):
             return [{"type": "text", "text": value}]
@@ -823,6 +1055,7 @@ class CodexAppServer:
         input: Any = None,
         timeout_seconds: float | None = None,
         on_server_request: Callable[[ServerRequest], None] | None = None,
+        before_send: Callable[[], None] | None = None,
         **options: Any,
     ) -> dict[str, Any]:
         """调用 ``turn/start``；字符串会变成标准 text 输入对象。"""
@@ -842,6 +1075,7 @@ class CodexAppServer:
             params,
             timeout_seconds=timeout_seconds,
             on_server_request=on_server_request,
+            before_send=before_send,
         )
 
     turn_start = start_turn
@@ -978,7 +1212,9 @@ __all__ = [
     "CodexAppServer",
     "CodexRPCClosed",
     "CodexRPCError",
+    "CodexRPCRejected",
     "CodexRPCUnhandledRequest",
+    "discover_desktop_codex_command",
     "CodexRPCTimeout",
     "ServerRequest",
     "TurnCompletedEvent",

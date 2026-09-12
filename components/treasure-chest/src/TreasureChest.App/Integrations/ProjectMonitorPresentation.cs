@@ -1,10 +1,36 @@
 namespace TreasureChest.Integrations;
 
+public enum CatalogMonitoringStatus
+{
+    Unmonitored,
+    LongTerm,
+    Temporary,
+}
+
 /// <summary>
 /// 项目监测在百宝箱中的统一排序与显示规则。
 /// </summary>
 public static class ProjectMonitorPresentation
 {
+    public static bool IsCatalogVisible(CodexThreadInfo item, bool includeArchived) => includeArchived || !item.Archived;
+
+    public static string CatalogCountTitle(int visibleCount, int catalogCount) =>
+        $"全部会话（当前显示 {visibleCount} / 目录 {catalogCount}）";
+
+    public static CatalogMonitoringStatus MonitoringStatus(CodexThreadInfo item, IEnumerable<ProjectMonitorItem> monitors)
+    {
+        var monitor = monitors.FirstOrDefault(candidate => candidate.ThreadId.Equals(item.Id, StringComparison.OrdinalIgnoreCase));
+        if (monitor is null) return CatalogMonitoringStatus.Unmonitored;
+        return monitor.IsManual ? CatalogMonitoringStatus.LongTerm : CatalogMonitoringStatus.Temporary;
+    }
+
+    public static string MonitoringStatusText(CatalogMonitoringStatus status) => status switch
+    {
+        CatalogMonitoringStatus.LongTerm => "长期监测",
+        CatalogMonitoringStatus.Temporary => "临时监测",
+        _ => "未监测",
+    };
+
     public static IReadOnlyList<ProjectMonitorItem> OrderMonitors(IEnumerable<ProjectMonitorItem> items) =>
         items.OrderBy(item => item.IsManual ? 0 : 1)
             .ThenBy(item => IsPersonal(item.Classification) ? 1 : 0)
@@ -46,8 +72,11 @@ public static class ProjectMonitorPresentation
             ? $"个人对话（{count}）"
             : $"项目 · {NormalizeClassification(classification)}（{count}）";
 
-    public static string DrawerGroupTitle(string classification, int count, bool expanded) =>
-        $"{(expanded ? "▼" : "▶")}  {GroupTitle(classification, count)}";
+    public static string DrawerGroupTitle(string classification, int count, bool expanded)
+    {
+        _ = expanded;
+        return GroupTitle(classification, count);
+    }
 
     public static string FormatTimestamp(DateTimeOffset? value) =>
         value?.ToLocalTime().ToString("yyyy-MM-dd HH:mm") ?? "—";

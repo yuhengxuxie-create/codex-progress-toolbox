@@ -206,6 +206,16 @@ class SummaryConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ResetAlertConfig:
+    """Codex 重置预警；来源地址固定在产品代码中，配置只控制安全门限。"""
+
+    enabled: bool = True
+    request_timeout_seconds: float = 15.0
+    forecast_threshold: int = 70
+    max_candidate_posts: int = 40
+
+
+@dataclass(frozen=True, slots=True)
 class AppConfig:
     path: Path
     codex: CodexConfig
@@ -214,6 +224,7 @@ class AppConfig:
     wechat: WeChatConfig
     service: ServiceConfig
     summary: SummaryConfig
+    reset_alert: ResetAlertConfig
 
     def validate_ready(self) -> None:
         if not self.codex.selectors.configured():
@@ -277,6 +288,7 @@ def load_config(path: str | os.PathLike[str] = DEFAULT_CONFIG_PATH, *, environ: 
     wechat_data = _mapping(root.get("wechat"), "wechat")
     service_data = _mapping(root.get("service"), "service")
     summary_data = _mapping(root.get("summary"), "summary")
+    reset_alert_data = _mapping(root.get("reset_alert"), "reset_alert")
 
     home = _path(codex_data.get("home"), config_dir, str(Path.home() / ".codex"))
     selectors = ThreadSelectors(
@@ -440,7 +452,42 @@ def load_config(path: str | os.PathLike[str] = DEFAULT_CONFIG_PATH, *, environ: 
         loopback = (parts.hostname or "").casefold() in {"localhost", "127.0.0.1", "::1"}
         if parts.scheme not in {"http", "https"} or (parts.scheme == "http" and not loopback):
             raise ConfigError("摘要 endpoint 仅允许 HTTPS，或 HTTP 回环地址")
-    return AppConfig(config_path, codex, messaging, feishu, wechat, service, summary)
+    reset_alert = ResetAlertConfig(
+        enabled=_boolean(
+            reset_alert_data.get("enabled"), "reset_alert.enabled", True
+        ),
+        request_timeout_seconds=_number(
+            reset_alert_data.get("request_timeout_seconds"),
+            "reset_alert.request_timeout_seconds",
+            15,
+            5,
+            30,
+        ),
+        forecast_threshold=_integer(
+            reset_alert_data.get("forecast_threshold"),
+            "reset_alert.forecast_threshold",
+            70,
+            70,
+            100,
+        ),
+        max_candidate_posts=_integer(
+            reset_alert_data.get("max_candidate_posts"),
+            "reset_alert.max_candidate_posts",
+            40,
+            1,
+            100,
+        ),
+    )
+    return AppConfig(
+        config_path,
+        codex,
+        messaging,
+        feishu,
+        wechat,
+        service,
+        summary,
+        reset_alert,
+    )
 
 
 class ReloadingConfig:

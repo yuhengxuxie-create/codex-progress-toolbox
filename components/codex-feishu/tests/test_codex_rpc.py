@@ -16,16 +16,48 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from progress_wx.codex_rpc import (  # noqa: E402
     CodexAppServer,
+    CodexRPCError,
+    CodexRPCRejected,
     CodexRPCUnhandledRequest,
     CodexRPCTimeout,
+    ServerNotification,
     ServerRequest,
     TurnCompletedEvent,
     command_argv,
+    discover_desktop_codex_command,
     validate_loopback_websocket_url,
 )
 
 
 class CodexRPCTests(unittest.TestCase):
+    def test_experimental_initialize_and_thread_status_are_explicit(self) -> None:
+        server_script = r'''
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    if message.get("method") == "initialize":
+        assert message["params"]["capabilities"] == {"experimentalApi": True}
+        print(json.dumps({"id": message["id"], "result": {}}), flush=True)
+    elif message.get("method") == "thread/read":
+        print(json.dumps({"id": message["id"], "result": {"thread": {"status": {"type": "active", "activeFlags": []}, "turns": []}}}), flush=True)
+    elif message.get("method") == "thread/goal/set":
+        print(json.dumps({"id": message["id"], "error": {"code": -32602, "message": "rejected"}}), flush=True)
+'''
+        client = CodexAppServer(
+            [sys.executable, "-u", "-c", server_script],
+            timeout_seconds=2,
+            experimental_api=True,
+        )
+        try:
+            self.assertTrue(client.thread_is_active(client.read_thread("thread-1")))
+            with self.assertRaises(CodexRPCRejected):
+                client.request(
+                    "thread/goal/set",
+                    {"threadId": "thread-1", "objective": "synthetic"},
+                )
+        finally:
+            client.close()
+
     def test_websocket_url_is_strictly_ipv4_loopback(self) -> None:
         self.assertEqual(
             validate_loopback_websocket_url("ws://127.0.0.1:6230/"),
@@ -144,6 +176,57 @@ class CodexRPCTests(unittest.TestCase):
             shim.write_text("@echo off\n", encoding="utf-8")
             self.assertEqual(command_argv(os.fspath(shim)), [os.fspath(shim), "app-server"])
 
+    def test_desktop_codex_discovery_prefers_verified_dynamic_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            local = Path(temporary)
+            current = local / "OpenAI" / "Codex" / "bin" / "dynamic-current" / "codex.exe"
+            current.parent.mkdir(parents=True)
+            current.write_bytes(b"synthetic executable")
+            found = discover_desktop_codex_command(
+                "old-configured-codex",
+                local_app_data=local,
+                desktop_cli_path=current,
+                windows=True,
+            )
+            self.assertEqual(Path(os.fspath(found)), current.resolve())
+
+    def test_desktop_codex_discovery_uses_authority_with_multiple_versions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            local = Path(temporary)
+            current = local / "OpenAI" / "Codex" / "bin" / "only-version" / "codex.exe"
+            current.parent.mkdir(parents=True)
+            current.write_bytes(b"synthetic executable")
+            stale = local / "OpenAI" / "Codex" / "bin" / "stale-version" / "codex.exe"
+            stale.parent.mkdir(parents=True)
+            stale.write_bytes(b"older executable")
+            found = discover_desktop_codex_command(
+                "old-configured-codex",
+                local_app_data=local,
+                desktop_cli_path=current,
+                windows=True,
+            )
+            self.assertEqual(Path(os.fspath(found)), current.resolve())
+
+    def test_desktop_codex_discovery_rejects_untrusted_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            local = Path(temporary)
+            outside = local / "outside" / "codex.exe"
+            outside.parent.mkdir(parents=True)
+            outside.write_bytes(b"untrusted")
+            with self.assertRaisesRegex(CodexRPCError, "可信路径"):
+                discover_desktop_codex_command(
+                    "old-configured-codex",
+                    local_app_data=local,
+                    desktop_cli_path=outside,
+                    windows=True,
+                )
+
+    def test_desktop_codex_discovery_keeps_explicit_non_windows_command(self) -> None:
+        configured = ["/opt/codex", "--profile", "synthetic"]
+        self.assertIs(
+            discover_desktop_codex_command(configured, windows=False), configured
+        )
+
     def test_turn_completed_event_uses_explicit_protocol_fields(self) -> None:
         event = TurnCompletedEvent.from_message(
             {
@@ -244,6 +327,115 @@ for line in sys.stdin:
             client.start()
             with self.assertRaises(CodexRPCTimeout):
                 client.listen_turn_completed(timeout_seconds=0.05)
+        finally:
+            client.close()
+
+    def test_before_send_runs_after_serialization_and_before_transport(self) -> None:
+        class FakeWebSocket:
+            def __init__(self) -> None:
+                self.received: queue.Queue[str] = queue.Queue()
+                self.events: list[str] = []
+
+            def settimeout(self, _value: object) -> None:
+                return None
+
+            def send(self, payload: str) -> None:
+                message = json.loads(payload)
+                self.events.append(f"send:{message.get('method')}")
+                if "id" in message:
+                    self.received.put(json.dumps({"id": message["id"], "result": {}}))
+
+            def recv(self) -> str:
+                return self.received.get(timeout=2)
+
+            def close(self) -> None:
+                self.received.put("")
+
+        fake = FakeWebSocket()
+        client = CodexAppServer(
+            websocket_url="ws://127.0.0.1:6231",
+            websocket_factory=lambda *_args, **_kwargs: fake,
+            timeout_seconds=1,
+        )
+        try:
+            client.initialize()
+            fake.events.clear()
+            client.request(
+                "thread/compact/start",
+                {"threadId": "thread-1"},
+                before_send=lambda: fake.events.append("submitted"),
+            )
+            self.assertEqual(
+                fake.events,
+                ["submitted", "send:thread/compact/start"],
+            )
+            with self.assertRaises(CodexRPCError):
+                client.request(
+                    "broken",
+                    {"bad": object()},
+                    before_send=lambda: fake.events.append("must-not-run"),
+                )
+            self.assertNotIn("must-not-run", fake.events)
+        finally:
+            client.close()
+
+    def test_settings_notification_requires_matching_thread_and_value(self) -> None:
+        server_script = r'''
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        print(json.dumps({"id": message["id"], "result": {}}), flush=True)
+    elif method == "thread/settings/update":
+        print(json.dumps({"method": "skills/changed", "params": {"cwds": ["D:/synthetic"]}}), flush=True)
+        print(json.dumps({"method": "thread/settings/updated", "params": {"threadId": "wrong-thread", "threadSettings": {"model": "wanted"}}}), flush=True)
+        print(json.dumps({"method": "thread/settings/updated", "params": {"threadId": "thread-1", "threadSettings": {"model": "wrong-value"}}}), flush=True)
+        print(json.dumps({"id": message["id"], "result": {}}), flush=True)
+        print(json.dumps({"method": "thread/settings/updated", "params": {"threadId": "thread-1", "threadSettings": {"model": "wanted"}}}), flush=True)
+'''
+        client = CodexAppServer(
+            [sys.executable, "-u", "-c", server_script], timeout_seconds=1
+        )
+        try:
+            _response, notification = client.request_with_notification(
+                "thread/settings/update",
+                {"threadId": "thread-1", "model": "wanted"},
+                notification_method="thread/settings/updated",
+                notification_matches=lambda params: (
+                    params.get("threadId") == "thread-1"
+                    and isinstance(params.get("threadSettings"), dict)
+                    and params["threadSettings"].get("model") == "wanted"
+                ),
+            )
+            self.assertIsInstance(notification, ServerNotification)
+            self.assertEqual(notification.params["threadId"], "thread-1")
+            self.assertEqual(notification.params["threadSettings"]["model"], "wanted")
+        finally:
+            client.close()
+
+    def test_settings_notification_timeout_is_result_unknown_boundary(self) -> None:
+        server_script = r'''
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    if message.get("method") == "initialize":
+        print(json.dumps({"id": message["id"], "result": {}}), flush=True)
+    elif message.get("method") == "thread/settings/update":
+        print(json.dumps({"id": message["id"], "result": {}}), flush=True)
+        print(json.dumps({"method": "thread/settings/updated", "params": {"threadId": "other", "threadSettings": {"effort": "high"}}}), flush=True)
+'''
+        client = CodexAppServer(
+            [sys.executable, "-u", "-c", server_script], timeout_seconds=0.2
+        )
+        try:
+            with self.assertRaises(CodexRPCTimeout):
+                client.request_with_notification(
+                    "thread/settings/update",
+                    {"threadId": "thread-1", "effort": "high"},
+                    notification_method="thread/settings/updated",
+                    notification_matches=lambda params: params.get("threadId") == "thread-1",
+                )
         finally:
             client.close()
 

@@ -1,39 +1,49 @@
 using TreasureChest.Core.Models;
+using TreasureChest.Services;
 
 namespace TreasureChest.UI;
 
 internal sealed class SessionDialog : Form
 {
-    private readonly TextBox _name = new();
-    private readonly TextBox _description = new();
-    private readonly TextBox _start = new();
-    private readonly TextBox _stop = new();
-    private readonly TextBox _status = new();
-    private readonly TextBox _process = new();
-    private readonly TextBox _working = new();
-    private readonly TextBox _log = new();
-    private readonly CheckBox _enabled = new() { Text = "启用此会话" };
-    private readonly CheckBox _autoStart = new() { Text = "TreasureChest 启动后自动启动" };
-    private readonly CheckBox _autoRestart = new() { Text = "意外退出时自动重启" };
-    private readonly NumericUpDown _attempts = new() { Minimum = 0, Maximum = 20, Value = 3, Width = 80 };
+    private readonly TextBox _name = new ThemedEmbeddedTextBox();
+    private readonly TextBox _description = new ThemedEmbeddedTextBox();
+    private readonly TextBox _start = new ThemedEmbeddedTextBox();
+    private readonly TextBox _stop = new ThemedEmbeddedTextBox();
+    private readonly TextBox _status = new ThemedEmbeddedTextBox();
+    private readonly TextBox _process = new ThemedEmbeddedTextBox();
+    private readonly TextBox _working = new ThemedEmbeddedTextBox();
+    private readonly TextBox _log = new ThemedEmbeddedTextBox();
+    private readonly ThemeCheckBox _enabled = new() { Text = "启用此会话" };
+    private readonly ThemeCheckBox _autoStart = new() { Text = "TreasureChest 启动后自动启动" };
+    private readonly ThemeCheckBox _autoRestart = new() { Text = "意外退出时自动重启" };
+    private readonly ThemeNumericUpDown _attempts = new() { Minimum = 0, Maximum = 20, Value = 3, Width = 80 };
     private readonly HashSet<string> _otherNames;
     private readonly string _id;
 
-    public SessionDialog(SessionDefinition? source, IEnumerable<string> otherNames)
+    public SessionDialog(SessionDefinition? source, IEnumerable<string> otherNames, bool guardianManaged = false)
     {
+        UiTheme.ConfigureDpiAwareForm(this);
         _otherNames = new HashSet<string>(otherNames, StringComparer.OrdinalIgnoreCase);
         _id = source?.Id ?? Guid.NewGuid().ToString("N");
         Text = source is null ? "添加后台服务" : "编辑后台服务";
         StartPosition = FormStartPosition.CenterParent;
         MinimumSize = new Size(760, 650);
         Size = new Size(820, 720);
-        Font = new Font("Microsoft YaHei UI", 9F);
+        Font = UiTheme.CreateFont();
         BackColor = UiTheme.Background;
+        Icon = IconService.LoadAppIcon();
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         MinimizeBox = false;
         BuildLayout();
         if (source is not null) LoadSource(source);
+        if (guardianManaged)
+        {
+            _autoStart.Enabled = _autoRestart.Enabled = _attempts.Enabled = false;
+            _autoStart.Text = "自动启动由通信守护管理";
+            _autoRestart.Text = "主动停止会保留；桌面不重复拉起";
+            _start.ReadOnly = _stop.ReadOnly = _status.ReadOnly = _working.ReadOnly = true;
+        }
     }
 
     public SessionDefinition Result { get; private set; } = new();
@@ -84,9 +94,14 @@ internal sealed class SessionDialog : Form
     {
         table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         table.Controls.Add(new Label { Text = label, AutoSize = true, Margin = new Padding(0, 10, 8, 8) }, 0, row);
-        control.Dock = DockStyle.Top;
-        control.Margin = new Padding(0, 5, 8, 8);
-        table.Controls.Add(control, 1, row);
+        control.Dock = DockStyle.Fill;
+        var input = new ThemedInputHost((TextBoxBase)control)
+        {
+            Dock = DockStyle.Top,
+            Height = 38,
+            Margin = new Padding(0, 5, 8, 8),
+        };
+        table.Controls.Add(input, 1, row);
         if (browse is not null) table.Controls.Add(browse, 2, row);
     }
 

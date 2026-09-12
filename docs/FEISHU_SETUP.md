@@ -39,5 +39,7 @@
 
 先发送测试消息，确认手机收到；再建立历史基线并启动服务。用 TreasureChest 查看后台状态和监测列表。若图片失败，先确认 `im:message:readonly` 和 `im:resource` 已加入并发布新版本。
 
-课堂版六张图位于 `components\codex-feishu\docs\assets\feishu-usage-classroom`，也可在机器人中发送“使用说明”。
+当前四页图解位于 `components\codex-feishu\docs\assets\feishu-usage-classroom-20260908`，也可在机器人中发送“.使用说明”。
 
+
+卡片按钮和表单还需在回调配置中订阅 card.action.trigger。底部菜单需要 application.bot.menu_v6 事件及 progress_wx_feature_center 菜单键，见 [详细设置](FEISHU_UPGRADE_PERMISSIONS.md)。

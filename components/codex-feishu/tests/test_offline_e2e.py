@@ -77,7 +77,11 @@ class IntegrationCodexStore:
 class IntegrationSummarizer:
     def summarize(self, event, *, wait=None):
         del wait
-        return ProgressReport("完成", f"已处理结构化轮次 {event.turn_id}")
+        return ProgressReport(
+            "完成",
+            f"已处理结构化轮次 {event.turn_id}",
+            "conversation_complete",
+        )
 
 
 def _fake_app_server_script() -> str:

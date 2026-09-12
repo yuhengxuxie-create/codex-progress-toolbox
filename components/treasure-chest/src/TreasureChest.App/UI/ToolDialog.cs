@@ -1,30 +1,33 @@
 using TreasureChest.Core.Models;
 using TreasureChest.Core.Services;
+using TreasureChest.Services;
 
 namespace TreasureChest.UI;
 
 internal sealed class ToolDialog : Form
 {
-    private readonly TextBox _name = new();
-    private readonly TextBox _target = new();
-    private readonly TextBox _arguments = new();
-    private readonly TextBox _working = new();
-    private readonly TextBox _icon = new();
-    private readonly TextBox _category = new();
-    private readonly CheckBox _enabled = new() { Text = "启用此工具", Checked = true };
+    private readonly TextBox _name = new ThemedEmbeddedTextBox();
+    private readonly TextBox _target = new ThemedEmbeddedTextBox();
+    private readonly TextBox _arguments = new ThemedEmbeddedTextBox();
+    private readonly TextBox _working = new ThemedEmbeddedTextBox();
+    private readonly TextBox _icon = new ThemedEmbeddedTextBox();
+    private readonly TextBox _category = new ThemedEmbeddedTextBox();
+    private readonly ThemeCheckBox _enabled = new() { Text = "启用此工具", Checked = true };
     private readonly HashSet<string> _otherNames;
     private readonly string _id;
 
     public ToolDialog(ToolDefinition? source, IEnumerable<string> otherNames)
     {
+        UiTheme.ConfigureDpiAwareForm(this);
         _otherNames = new HashSet<string>(otherNames, StringComparer.OrdinalIgnoreCase);
         _id = source?.Id ?? Guid.NewGuid().ToString("N");
         Text = source is null ? "添加工具" : "编辑工具";
         StartPosition = FormStartPosition.CenterParent;
         Size = new Size(720, 490);
         MinimumSize = Size;
-        Font = new Font("Microsoft YaHei UI", 9F);
+        Font = UiTheme.CreateFont();
         BackColor = UiTheme.Background;
+        Icon = IconService.LoadAppIcon();
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         BuildLayout();
@@ -60,7 +63,13 @@ internal sealed class ToolDialog : Form
     {
         table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         table.Controls.Add(new Label { Text = label, AutoSize = true, Margin = new Padding(0, 10, 8, 8) }, 0, row);
-        control.Dock = DockStyle.Top; control.Margin = new Padding(0, 5, 8, 8); table.Controls.Add(control, 1, row);
+        control.Dock = DockStyle.Fill;
+        table.Controls.Add(new ThemedInputHost((TextBoxBase)control)
+        {
+            Dock = DockStyle.Top,
+            Height = 38,
+            Margin = new Padding(0, 5, 8, 8),
+        }, 1, row);
         if (browse is not null) table.Controls.Add(browse, 2, row);
     }
 

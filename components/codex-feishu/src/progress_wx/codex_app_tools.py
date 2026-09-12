@@ -1,9 +1,10 @@
 """Codex Desktop 动态应用工具的本地命名管道客户端。
 
 本模块只读取 Codex Desktop 自己的日志来发现本机管道，并在调用工具前用
-``tools/list`` 验明具体工具身份。生产路径只使用 ``list_threads``、``wait_threads``
-和 ``send_message_to_thread``；它不修改代理、环境变量、路由或 TUN，也不启动、
-停止或接管 Codex 进程。
+``tools/list`` 验明具体工具身份。生产路径只使用已验明的
+``list_threads``、``wait_threads``、``send_message_to_thread`` 和
+``set_thread_archived``；它不修改代理、环境变量、路由或 TUN，也不启动、停止或
+接管 Codex 进程。
 """
 
 from __future__ import annotations
@@ -21,12 +22,21 @@ from typing import Any, Callable, Protocol
 
 
 MAX_FRAME_BYTES = 8 * 1024 * 1024
+_PIPE_NAME = re.compile(
+    r"codex-browser-use-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
 _PIPE_LINE = re.compile(
     r"\[dynamic-app-tools-native-pipe\]\s+dynamic_app_tools_listening\s+"
     r"pipePath=(?P<path>\\\\\.\\pipe\\codex-browser-use-"
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
 )
+_CODEX_CLI_LINE = re.compile(
+    r"\bbrowser_use_runtime_paths_selected\b.*?\bcodexCliPath=(?P<path>.+?\\codex\.exe)\s+"
+    r"codexCliPathSource=(?P<source>[^\s]+)"
+)
+_MAX_RUNTIME_LOG_BYTES = 32 * 1024 * 1024
 
 
 class DesktopAppToolsError(RuntimeError):
@@ -39,6 +49,14 @@ class DesktopAppToolsUnavailable(DesktopAppToolsError):
 
 class DesktopAppToolsResultUnknown(DesktopAppToolsError):
     """正文已经进入写入阶段，但未取得可证明的结果。"""
+
+
+class DesktopAppToolsNotSubmitted(DesktopAppToolsError):
+    """工具调用在任何请求字节写入前失败，可以安全释放 claim。"""
+
+
+class DesktopAppToolsRejected(DesktopAppToolsError):
+    """Desktop 明确拒绝工具调用，已证明正文没有被接受。"""
 
 
 class _FramePipe(Protocol):
@@ -225,13 +243,15 @@ class _WindowsFramePipe:
         return bytes(result)
 
     def request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self._handle is None:
+            raise DesktopAppToolsNotSubmitted("Codex Desktop 工具管道在写入前已关闭")
         encoded = json.dumps(
             payload,
             ensure_ascii=False,
             separators=(",", ":"),
         ).encode("utf-8")
         if not encoded or len(encoded) > MAX_FRAME_BYTES:
-            raise DesktopAppToolsError("Codex Desktop 工具请求大小无效")
+            raise DesktopAppToolsNotSubmitted("Codex Desktop 工具请求大小无效")
         self._write_all(len(encoded).to_bytes(4, "little") + encoded)
         header = self._read_exactly(4)
         size = int.from_bytes(header, "little")
@@ -258,6 +278,7 @@ class VerifiedDesktopAppTools:
 
     pipe: _FramePipe
     tools: frozenset[str]
+    source_pipe_path: str = ""
     _next_id: int = 2
 
     def _call(
@@ -273,25 +294,40 @@ class VerifiedDesktopAppTools:
             raise DesktopAppToolsUnavailable(f"Desktop 未验明 {tool} 工具")
         request_id = self._next_id
         self._next_id += 1
-        response = self.pipe.request(
-            {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "method": "tools/call",
-                "params": {
-                    "arguments": arguments,
-                    "callId": f"progress-wx-{call_tag}-{uuid.uuid4().hex}",
-                    "namespace": "codex_app",
-                    "threadId": source_thread_id,
-                    "turnId": f"progress-wx-{call_tag}",
-                    "tool": tool,
-                },
-            }
-        )
-        error_type = DesktopAppToolsResultUnknown if write else DesktopAppToolsError
+        try:
+            response = self.pipe.request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "tools/call",
+                    "params": {
+                        "arguments": arguments,
+                        "callId": f"progress-wx-{call_tag}-{uuid.uuid4().hex}",
+                        "namespace": "codex_app",
+                        "threadId": source_thread_id,
+                        "turnId": f"progress-wx-{call_tag}",
+                        "tool": tool,
+                    },
+                }
+            )
+        except (
+            DesktopAppToolsNotSubmitted,
+            DesktopAppToolsRejected,
+            DesktopAppToolsResultUnknown,
+            DesktopAppToolsUnavailable,
+        ):
+            raise
+        except (OSError, EOFError, TimeoutError, DesktopAppToolsError) as exc:
+            if write:
+                raise DesktopAppToolsResultUnknown(
+                    f"Desktop {tool} 工具提交后的传输结果未知"
+                ) from exc
+            raise
         if response.get("id") != request_id:
+            error_type = DesktopAppToolsResultUnknown if write else DesktopAppToolsError
             raise error_type("Desktop 工具响应 ID 不一致")
         if "error" in response:
+            error_type = DesktopAppToolsRejected if write else DesktopAppToolsError
             raise error_type(f"Desktop {tool} 工具明确返回调用错误")
         result = response.get("result")
         if (
@@ -299,7 +335,8 @@ class VerifiedDesktopAppTools:
             or result.get("isError") is True
             or result.get("success") is False
         ):
-            raise error_type(f"Desktop {tool} 工具未返回可证明的成功结果")
+            error_type = DesktopAppToolsRejected if write else DesktopAppToolsError
+            raise error_type(f"Desktop {tool} 工具明确返回未接受结果")
         return result
 
     @staticmethod
@@ -345,6 +382,49 @@ class VerifiedDesktopAppTools:
             call_tag=call_tag,
             write=True,
         )
+
+    def set_thread_archived(
+        self,
+        thread_id: str,
+        *,
+        archived: bool,
+        source_thread_id: str,
+        host_id: str = "",
+        call_tag: str,
+    ) -> dict[str, Any]:
+        """通过 Codex Desktop 官方工具归档/恢复一个明确目标任务。"""
+
+        target = str(thread_id or "").strip()
+        source = str(source_thread_id or "").strip()
+        if not target:
+            raise ValueError("set_thread_archived thread_id 不能为空")
+        if not source:
+            raise ValueError("set_thread_archived source_thread_id 不能为空")
+        if not isinstance(archived, bool):
+            raise TypeError("set_thread_archived archived 必须是 bool")
+        arguments: dict[str, Any] = {
+            "threadId": target,
+            "archived": archived,
+        }
+        host = str(host_id or "").strip()
+        if host:
+            arguments["hostId"] = host
+        result = self._call(
+            "set_thread_archived",
+            arguments,
+            source_thread_id=source,
+            call_tag=call_tag,
+            write=True,
+        )
+        if not (
+            result.get("success") is True
+            or isinstance(result.get("content"), list)
+            or isinstance(result.get("contentItems"), list)
+        ):
+            raise DesktopAppToolsResultUnknown(
+                "Desktop set_thread_archived 工具未返回可证明的成功结果"
+            )
+        return result
 
     def list_projects(
         self,
@@ -480,6 +560,7 @@ class DesktopAppToolsClient:
         connect_timeout: float = 2.0,
         response_timeout: float = 30.0,
         connector: Callable[[str, float, float], _FramePipe] | None = None,
+        live_pipe_names: Callable[[], list[str]] | None = None,
     ) -> None:
         self.log_dir = log_dir.expanduser().resolve()
         self.connect_timeout = float(connect_timeout)
@@ -491,10 +572,32 @@ class DesktopAppToolsClient:
                 response_timeout=response,
             )
         )
+        # 生产默认直接枚举当前 Windows 命名管道；使用测试 connector 时保持
+        # 旧的纯日志夹具语义，测试可显式传入 live_pipe_names 覆盖。
+        self._live_pipe_names = live_pipe_names or (
+            (lambda: os.listdir(r"\\.\pipe")) if connector is None and os.name == "nt"
+            else (lambda: [])
+        )
 
     def _candidate_paths(self) -> list[str]:
+        found: list[str] = []
+        live_error: OSError | None = None
+        try:
+            for raw_name in self._live_pipe_names():
+                name = str(raw_name)
+                if _PIPE_NAME.fullmatch(name):
+                    candidate = rf"\\.\pipe\{name}"
+                    if candidate not in found:
+                        found.append(candidate)
+        except OSError as exc:
+            # 日志仍可作为旧版 Desktop 或受限环境的发现回退；若两路都失败，
+            # 下面会保留实时枚举异常为最终 cause。
+            live_error = exc
+
         if not self.log_dir.is_dir():
-            raise DesktopAppToolsUnavailable("找不到 Codex Desktop 日志目录")
+            if found:
+                return found
+            raise DesktopAppToolsUnavailable("找不到 Codex Desktop 日志目录") from live_error
         try:
             files = sorted(
                 self.log_dir.glob("**/codex-desktop-*-t0-*.log"),
@@ -503,7 +606,6 @@ class DesktopAppToolsClient:
             )[:64]
         except OSError as exc:
             raise DesktopAppToolsUnavailable("无法枚举 Codex Desktop 日志") from exc
-        found: list[str] = []
         for path in files:
             try:
                 # 管道公布在启动日志前部；限制读取量，避免扫描长期大日志。
@@ -517,8 +619,66 @@ class DesktopAppToolsClient:
                 if candidate not in found:
                     found.append(candidate)
         if not found:
-            raise DesktopAppToolsUnavailable("Codex Desktop 日志中没有应用工具管道")
+            raise DesktopAppToolsUnavailable(
+                "Codex Desktop 日志中没有应用工具管道，实时枚举也没有有效候选"
+            ) from live_error
         return found
+
+    def _log_files(self) -> tuple[Path, ...]:
+        if not self.log_dir.is_dir():
+            raise DesktopAppToolsUnavailable("找不到 Codex Desktop 日志目录")
+        try:
+            return tuple(
+                sorted(
+                    self.log_dir.glob("**/codex-desktop-*-t0-*.log"),
+                    key=lambda item: item.stat().st_mtime_ns,
+                    reverse=True,
+                )[:64]
+            )
+        except OSError as exc:
+            raise DesktopAppToolsUnavailable("无法枚举 Codex Desktop 日志") from exc
+
+    def discover_current_codex_cli(self) -> str:
+        """从已验明的当前 Desktop 管道对应日志读取 bundled CLI 路径。"""
+
+        session = self.open_verified(required_tools=("list_threads",))
+        try:
+            pipe_path = session.source_pipe_path
+        finally:
+            session.close()
+        if not pipe_path:
+            raise DesktopAppToolsUnavailable("已验证 Desktop 管道缺少来源身份")
+        for path in self._log_files():
+            matched_pipe = False
+            cli_rows: list[tuple[str, str]] = []
+            consumed = 0
+            try:
+                with path.open("r", encoding="utf-8", errors="replace") as handle:
+                    for line in handle:
+                        consumed += len(line.encode("utf-8", errors="replace"))
+                        if consumed > _MAX_RUNTIME_LOG_BYTES:
+                            break
+                        pipe_match = _PIPE_LINE.search(line)
+                        if pipe_match and pipe_match.group("path") == pipe_path:
+                            matched_pipe = True
+                        cli_match = _CODEX_CLI_LINE.search(line)
+                        if cli_match:
+                            cli_rows.append(
+                                (cli_match.group("path"), cli_match.group("source"))
+                            )
+            except OSError:
+                continue
+            if not matched_pipe:
+                continue
+            trusted = [value for value, source in cli_rows if source == "bundled-or-dev"]
+            if trusted:
+                return trusted[-1]
+            raise DesktopAppToolsUnavailable(
+                "当前 Codex Desktop 日志没有 bundled-or-dev CLI 身份"
+            )
+        raise DesktopAppToolsUnavailable(
+            "无法把已验证 Desktop 管道关联到同一份运行日志"
+        )
 
     def open_verified(
         self,
@@ -555,7 +715,9 @@ class DesktopAppToolsClient:
                     raise DesktopAppToolsUnavailable(
                         "Desktop 未公布全部且唯一的必需任务工具"
                     )
-                return VerifiedDesktopAppTools(pipe, available)
+                return VerifiedDesktopAppTools(
+                    pipe, available, source_pipe_path=pipe_path
+                )
             except DesktopAppToolsUnavailable as exc:
                 errors.append(exc)
                 if pipe is not None:
@@ -581,6 +743,8 @@ def default_codex_desktop_log_dir() -> Path:
 __all__ = [
     "DesktopAppToolsClient",
     "DesktopAppToolsError",
+    "DesktopAppToolsNotSubmitted",
+    "DesktopAppToolsRejected",
     "DesktopAppToolsResultUnknown",
     "DesktopAppToolsUnavailable",
     "VerifiedDesktopAppTools",

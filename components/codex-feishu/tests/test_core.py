@@ -16,7 +16,7 @@ from progress_wx.formatting import (
 )
 from progress_wx.models import ProgressReport, ProgressStatus, TurnEvent, structural_report
 from progress_wx.retry import RetryExhausted, RetryPolicy, call_with_retry
-from progress_wx.state import CorrelationCodec, StateError, StateStore
+from progress_wx.state import SCHEMA_VERSION, CorrelationCodec, StateError, StateStore
 
 
 def test_structural_status_never_reads_message_keywords() -> None:
@@ -103,7 +103,9 @@ def test_legacy_channel_can_include_visible_reply_code() -> None:
     assert text.split("\n\n")[-1] == "回复编号：PCWX-ABCDEFGH-0123456789AB"
 
 
-def test_signed_code_is_one_time_and_bound_to_thread(tmp_path: Path) -> None:
+def test_turn_parent_is_reusable_and_each_inbound_message_is_exactly_once(
+    tmp_path: Path,
+) -> None:
     codec = CorrelationCodec(b"s" * 32)
     store = StateStore(tmp_path / "state.sqlite")
     event = TurnEvent("thread-1", "turn-1", "completed")
@@ -111,20 +113,43 @@ def test_signed_code_is_one_time_and_bound_to_thread(tmp_path: Path) -> None:
     message = format_notification(event, structural_report(event), code)
     store.reserve_notification(event, code, message, 72)
     store.mark_sent(event.dedupe_key)
-    assert store.consume_reply(code, "message-1", codec, reply_text="继续") == (
-        "thread-1",
-        "turn-1",
-        "turn",
+    first = store.enqueue_turn_reply(
+        code, "message-1", "fingerprint-1", codec, reply_text="继续"
     )
-    assert store.consume_reply(code, "message-2", codec, reply_text="继续") is None
-    assert store.consume_reply(code[:-1] + "0", "message-3", codec, reply_text="继续") is None
-    assert store.pending_turn_replies() == [(code, "thread-1", "继续", "message-1")]
-    assert store.claim_turn_reply(code) is True
-    assert store.uncertain_turn_replies() == [code]
+    second = store.enqueue_turn_reply(
+        code, "message-2", "fingerprint-2", codec, reply_text="继续"
+    )
+    third = store.enqueue_turn_reply(
+        code, "message-3", "fingerprint-3", codec, reply_text="再补一条"
+    )
+    duplicate = store.enqueue_turn_reply(
+        code, "message-1", "fingerprint-1", codec, reply_text="继续"
+    )
+    assert first is not None and first.is_new is True
+    assert second is not None and second.is_new is True
+    assert third is not None and third.is_new is True
+    assert duplicate is not None and duplicate.is_new is False
+    assert duplicate.delivery_id == first.delivery_id
+    invalid_code = code[:-1] + ("0" if code[-1] != "0" else "1")
+    assert store.enqueue_turn_reply(
+        invalid_code, "message-4", "fingerprint-4", codec, reply_text="继续"
+    ) is None
+    assert store.pending_turn_replies() == [
+        (first.delivery_id, "thread-1", "继续", "fingerprint-1"),
+        (second.delivery_id, "thread-1", "继续", "fingerprint-2"),
+        (third.delivery_id, "thread-1", "再补一条", "fingerprint-3"),
+    ]
+    assert store.claim_turn_reply(first.delivery_id) is True
+    assert store.uncertain_turn_replies() == [first.delivery_id]
     assert store.resolve_uncertain_reply(code, delivered=False) is True
-    assert store.pending_turn_replies() == [(code, "thread-1", "继续", "message-1")]
-    assert store.claim_turn_reply(code) is True
-    store.mark_reply_delivered(code)
+    assert store.pending_turn_replies()[0] == (
+        first.delivery_id,
+        "thread-1",
+        "继续",
+        "fingerprint-1",
+    )
+    assert store.claim_turn_reply(first.delivery_id) is True
+    store.mark_reply_delivered(first.delivery_id)
     assert store.uncertain_turn_replies() == []
     store.close()
 
@@ -138,13 +163,15 @@ def test_stale_pending_reply_discard_is_exact_age_gated_and_clears_body(
     code = codec.issue()
     store.reserve_notification(event, code, "通知", 72)
     store.mark_sent(event.dedupe_key)
-    assert store.consume_reply(
+    delivery = store.enqueue_turn_reply(
         code,
+        "message-stale",
         "message-stale",
         codec,
         reply_text="陈旧测试正文",
         now=1_000,
-    ) is not None
+    )
+    assert delivery is not None
 
     with pytest.raises(StateError, match="数量或年龄"):
         store.discard_stale_pending_turn_replies(
@@ -165,8 +192,8 @@ def test_stale_pending_reply_discard_is_exact_age_gated_and_clears_body(
     ) == 1
     assert store.pending_turn_replies() == []
     row = store._connection.execute(
-        "SELECT discarded_at, reply_text FROM notifications WHERE code=?",
-        (code,),
+        "SELECT discarded_at, reply_text FROM reply_deliveries WHERE delivery_id=?",
+        (delivery.delivery_id,),
     ).fetchone()
     assert tuple(row) == (2_000, None)
     store.close()
@@ -306,15 +333,216 @@ def test_old_state_schema_migration_is_serialized(tmp_path: Path) -> None:
         "channel_message_id",
         "discarded_at",
     } <= columns
-    assert version == "10"
+    assert version == str(SCHEMA_VERSION)
+    assert "notification_media_deliveries" in tables
     assert {
         "management_contexts",
         "management_message_ids",
         "management_inbound_messages",
+        "reply_deliveries",
         "staged_image_replies",
         "monitor_subscriptions",
         "monitor_suppressions",
+        "session_search_cache",
+        "session_search_judgments",
+        "thread_title_recoveries",
     } <= tables
+
+
+def test_v11_search_judgment_migrates_display_title_and_forces_safe_reassessment(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite"
+    current = StateStore(path)
+    with current._lock, current._connection:
+        current._connection.execute("DROP TABLE session_search_judgments")
+        current._connection.execute(
+            """CREATE TABLE session_search_judgments (
+                query_hash TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                score REAL NOT NULL,
+                confidence TEXT NOT NULL,
+                classification TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(query_hash, thread_id, content_hash)
+            )"""
+        )
+        current._connection.execute(
+            """INSERT INTO session_search_judgments(
+                query_hash, thread_id, content_hash, score, confidence,
+                classification, reason, updated_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("a" * 64, "legacy-thread", "b" * 64, 0.8, "high", "strong_match", "旧判断", 1),
+        )
+        current._connection.execute(
+            "UPDATE meta SET value='11' WHERE key='schema_version'"
+        )
+    current.close()
+
+    migrated = StateStore(path)
+    try:
+        columns = {
+            row[1]
+            for row in migrated._connection.execute(
+                "PRAGMA table_info(session_search_judgments)"
+            )
+        }
+        assert "display_title" in columns
+        assert migrated._connection.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()[0] == str(SCHEMA_VERSION)
+        assert migrated.session_search_judgment(
+            "a" * 64, "legacy-thread", "b" * 64
+        ) is None
+    finally:
+        migrated.close()
+
+
+def test_thread_title_recovery_is_content_versioned_and_pruned(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite"
+    store = StateStore(path)
+    try:
+        store.put_thread_title_recovery(
+            thread_id="thread-title",
+            content_hash="a" * 64,
+            display_title="修复历史自动化工具",
+            now=100,
+        )
+        cached = store.thread_title_recovery("thread-title", "a" * 64)
+        assert cached is not None
+        assert cached["display_title"] == "修复历史自动化工具"
+        assert cached["source"] == "luna_recovery"
+        assert store.thread_title_recovery("thread-title", "b" * 64) is None
+        removed = store.prune(retention_days=30, now=100 + 91 * 86400)
+        assert removed["thread_title_recoveries"] == 1
+        assert store.thread_title_recovery("thread-title", "a" * 64) is None
+    finally:
+        store.close()
+
+
+def test_v12_turn_reply_history_migrates_without_replay_or_state_loss(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite"
+    prepared = StateStore(path)
+    with prepared._lock, prepared._connection:
+        prepared._connection.execute("DELETE FROM reply_deliveries")
+        prepared._connection.execute("UPDATE meta SET value='12' WHERE key='schema_version'")
+        for index, state in enumerate(("pending", "uncertain", "delivered", "discarded")):
+            claimed_at = 2_000 + index if state == "uncertain" else None
+            delivered_at = 3_000 + index if state == "delivered" else None
+            discarded_at = 4_000 + index if state == "discarded" else None
+            prepared._connection.execute(
+                """
+                INSERT INTO notifications(
+                    event_key, code, thread_id, turn_id, reply_kind,
+                    message_text, created_at, expires_at, sent_at, consumed_at,
+                    reply_fingerprint, reply_text, claimed_at, delivered_at, discarded_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    f"legacy-event-{index}",
+                    f"legacy-code-{index}",
+                    "legacy-thread",
+                    f"legacy-turn-{index}",
+                    "turn",
+                    "legacy notice",
+                    900 + index,
+                    9_999,
+                    950 + index,
+                    1_000 + index,
+                    f"legacy-fingerprint-{index}",
+                    None if state == "discarded" else f"legacy-reply-{index}",
+                    claimed_at,
+                    delivered_at,
+                    discarded_at,
+                ),
+            )
+        prepared._connection.execute("DROP TABLE reply_deliveries")
+    prepared.close()
+
+    migrated = StateStore(path)
+    try:
+        rows = migrated._connection.execute(
+            "SELECT * FROM reply_deliveries ORDER BY sequence"
+        ).fetchall()
+        assert len(rows) == 4
+        assert migrated.pending_turn_replies() == [
+            (
+                str(rows[0]["delivery_id"]),
+                "legacy-thread",
+                "legacy-reply-0",
+                "legacy-fingerprint-0",
+            )
+        ]
+        assert migrated.uncertain_turn_replies() == [str(rows[1]["delivery_id"])]
+        assert rows[2]["delivered_at"] == 3_002
+        assert rows[2]["receipt_required"] == 0
+        assert rows[2]["receipt_sent_at"] == 3_002
+        assert rows[3]["discarded_at"] == 4_003
+        assert rows[3]["reply_text"] is None
+        assert migrated.pending_delivery_receipts() == []
+        assert migrated._connection.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()[0] == str(SCHEMA_VERSION)
+    finally:
+        migrated.close()
+
+
+def test_search_cache_keeps_old_content_versions_until_ninety_day_prune(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite")
+    old_hash = "a" * 64
+    new_hash = "b" * 64
+    query_hash = "c" * 64
+    store.put_session_search_cache(
+        thread_id="thread-versioned",
+        content_hash=old_hash,
+        latest_turn_id="turn-old",
+        description="旧描述",
+        evidence={"version": "old"},
+        last_result="旧结果",
+        last_activity_at=1_000,
+        now=1_000,
+    )
+    store.put_session_search_judgment(
+        query_hash=query_hash,
+        thread_id="thread-versioned",
+        content_hash=old_hash,
+        score=0.8,
+        confidence="high",
+        classification="strong_match",
+        display_title="旧展示名",
+        reason="旧理由",
+        now=1_000,
+    )
+    store.put_session_search_cache(
+        thread_id="thread-versioned",
+        content_hash=new_hash,
+        latest_turn_id="turn-new",
+        description="新描述",
+        evidence={"version": "new"},
+        last_result="新结果",
+        last_activity_at=2_000,
+        now=2_000,
+    )
+
+    assert store.session_search_cache("thread-versioned", old_hash) is not None
+    assert store.session_search_cache("thread-versioned", new_hash) is not None
+    assert store.session_search_judgment(
+        query_hash, "thread-versioned", old_hash
+    ) is not None
+    assert store.session_search_judgment(
+        query_hash, "thread-versioned", new_hash
+    ) is None
+
+    removed = store.prune(now=1_000 + 91 * 86_400)
+    assert removed["session_search_cache"] == 2
+    assert removed["session_search_judgments"] == 1
+    store.close()
 
 
 def test_staged_image_reply_append_replace_expire_and_clear(tmp_path: Path) -> None:

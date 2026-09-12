@@ -1,23 +1,13 @@
-# Codex 飞书后台组件
+# 飞书任务管理与进度监测
 
-这是 Codex Feishu Ecosystem v1.5.0 的后台公共源码，同时承载两个逻辑组件：
+本组件属于 1.6.0 本地候选，尚未正式发布；公开最新版仍是 v1.5.0。
 
-- Codex 管理：从飞书查看项目与会话、新建或继续任务、传递图片、处理用户级权限审批、查询额度。
-- Codex 进度监测：发现和登记任务，识别完成、失败、打断、待审批与待用户输入，并向飞书发送进度。
+飞书“功能中心”提供创建、查询与搜索任务、引用图文续聊、指令使用、监测和额度预警等入口。用户说明优先见 [完整文字指南](docs/FEISHU_USAGE.md)；发送 `.使用说明` 可查看当前四页图解，旧六页仅保留为历史资源。
 
-飞书通道使用企业自建应用机器人和官方 WebSocket 长连接，不使用 v1.2.0 的群自定义机器人 Webhook。它不要求公网回调服务器，也不依赖电脑飞书客户端。
+直接文字入口使用行首 ASCII 半角句点，例如 `.功能中心`、`.新建个人会话`、`.项目新会话`、`.查看指令列表`。旧无点精确入口只提示新写法；按钮、引用编号和普通任务正文保持原操作，`/project`、`/commands` 及原生 `/`、`$` 语法保持兼容。详见完整文字指南。
 
-## 运行与配置
+已有用户保留原应用与绑定，按 [飞书配置增量](docs/FEISHU_UPGRADE_PERMISSIONS.md) 补卡片回调与可选底部菜单。本次四项权限 scope 不增加。安装和升级使用生态根目录 UPGRADE.md，不单独覆盖生产目录。
 
-面向普通用户时，请从仓库 Release 下载 `codex-feishu-ecosystem-v1.5.0-full.zip`，把整个解压目录交给 Codex，并遵循根目录 `AGENTS.md`。不要单独运行本组件的生产安装脚本。
+数据库 schema 为 23，升级旧 schema 10 必须先一致备份再迁移，回滚恢复原程序和原数据库。状态和配置检查是只读命令。凭据、状态、日志和用户内容都不属于公共分发文件。
 
-开发者可在本目录运行：
-
-```powershell
-python -m pip install -r requirements-dev.txt
-python -m pytest
-```
-
-运行配置从 `config.example.yaml` 生成。真实 `config.yaml`、`.secrets`、`.state`、数据库和日志永远不得提交或再次打包。App Secret 只能通过本机无回显窗口写入 Windows DPAPI，不能粘贴到 Codex 对话。
-
-组件产品版本为 1.5.0；`schema_version` 是独立的协议/状态库版本，不随产品版本重写。
+维护者运行测试时在组件目录设置 PYTHONPATH=src，使用隔离 Python 环境执行 pytest；不要依赖生产 editable 安装。当前依赖使用 requirements-feishu.txt 和 requirements-core.txt 的哈希锁。

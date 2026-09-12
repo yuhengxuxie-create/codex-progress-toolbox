@@ -1,5 +1,10 @@
-Set-StrictMode -Version Latest
-$script:EcosystemVersion = '1.5.0'
+﻿Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'guardian-lifecycle.ps1')
+$VersionFile = Join-Path (Split-Path -Parent $PSScriptRoot) 'PACKAGE_VERSION.txt'
+$script:EcosystemVersion = if (Test-Path -LiteralPath $VersionFile -PathType Leaf) {
+    (Get-Content -LiteralPath $VersionFile -Raw).Trim()
+} else { '1.5.0' }
+if ($script:EcosystemVersion -notmatch '^\d+\.\d+\.\d+$') { throw '生态版本号无效。' }
 $script:SentinelName = '.codex-feishu-ecosystem-root'
 
 function Get-DefaultEcosystemRoot {
@@ -142,6 +147,9 @@ function New-EcosystemTransaction {
         legacy_service_was_running = $false
         status = 'prepared'
     }
+    $TaskSnapshot = Join-Path $BackupRoot 'guardian-task.json'
+    Export-GuardianTaskState -InstallRoot $InstallFull -SnapshotPath $TaskSnapshot
+    $Manifest.guardian_task_snapshot = $TaskSnapshot
     Write-JsonFile -Path $ManifestPath -Value $Manifest
     return [pscustomobject]@{ Manifest = $Manifest; ManifestPath = $ManifestPath }
 }
@@ -164,14 +172,27 @@ function Remove-VerifiedInstallTree {
 }
 
 function Restore-EcosystemTransaction {
-    param([Parameter(Mandatory = $true)][string]$ManifestPath)
+    param([Parameter(Mandatory = $true)][string]$ManifestPath, [switch]$AutomaticFailure)
     $Manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
     if ($Manifest.schema_version -ne 1) { throw '不支持的事务清单版本。' }
     $InstallRoot = Resolve-SafeLocalRoot -Path ([string]$Manifest.install_root)
     $BackupRoot = Resolve-SafeLocalRoot -Path ([string]$Manifest.backup_root)
     if (-not (Test-PathWithinRoot -Path $ManifestPath -Root $BackupRoot)) { throw '事务清单不在声明的备份根内。' }
 
+    # Installed rollback replaces its own installer directory. Keep the exact
+    # validated controller outside that tree for task restoration afterwards.
+    $TaskController = Join-Path $BackupRoot 'guardian-task-controller.ps1'
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'guardian-task.ps1') -Destination $TaskController -Force
     if (Test-Path -LiteralPath $InstallRoot -PathType Container) {
+        $TaskState = & (Join-Path $PSScriptRoot 'guardian-task.ps1') -Mode Status -InstallRoot $InstallRoot | ConvertFrom-Json
+        # A failed first installation can have copied the CLI before Python
+        # exists. Only this uninitialized transaction may restore without a
+        # CLI query; any persisted state or recovery task remains fail-closed.
+        $Uninitialized = Test-UninitializedTransactionRuntime -InstallRoot $InstallRoot -Manifest $Manifest -TaskInstalled ([bool]$TaskState.installed)
+        $QuiescedUpgrade = $false
+        if ($AutomaticFailure) { $QuiescedUpgrade = Test-QuiescedUpgradeRollback -InstallRoot $InstallRoot -BackupRoot $BackupRoot -Manifest $Manifest -TaskState $TaskState }
+        if (-not $Uninitialized -and -not $QuiescedUpgrade) { $null = Enter-UpgradeGuardianMaintenance -InstallRoot $InstallRoot }
+        if ($TaskState.installed) { & (Join-Path $PSScriptRoot 'guardian-task.ps1') -Mode Remove -InstallRoot $InstallRoot }
         Remove-VerifiedInstallTree -InstallRoot $InstallRoot
     }
     if ([bool]$Manifest.source_existed) {
@@ -195,7 +216,142 @@ function Restore-EcosystemTransaction {
             Remove-Item -LiteralPath $Target -Force
         }
     }
+    if ($Manifest.PSObject.Properties.Name -contains 'guardian_task_snapshot') {
+        $TaskSnapshot = [IO.Path]::GetFullPath([string]$Manifest.guardian_task_snapshot)
+        if (-not (Test-PathWithinRoot -Path $TaskSnapshot -Root $BackupRoot)) { throw 'Guardian snapshot is outside the transaction.' }
+        & $TaskController -Mode Restore -InstallRoot $InstallRoot -SnapshotPath $TaskSnapshot
+    }
+    if ($Manifest.PSObject.Properties.Name -contains 'guardian_original_intent') {
+        Leave-UpgradeGuardianMaintenance -InstallRoot $InstallRoot -Original $Manifest.guardian_original_intent
+    }
+    if ($Manifest.PSObject.Properties.Name -contains 'guardian_source_task_snapshot') {
+        $SourceTaskSnapshot=[IO.Path]::GetFullPath([string]$Manifest.guardian_source_task_snapshot)
+        if(-not (Test-PathWithinRoot -Path $SourceTaskSnapshot -Root $BackupRoot)){throw 'Source task snapshot is outside transaction.'}
+        $SourceRoot=Resolve-SafeLocalRoot -Path ([string]$Manifest.legacy_root)
+        & $TaskController -Mode Restore -InstallRoot $SourceRoot -SnapshotPath $SourceTaskSnapshot
+    }
     Update-TransactionManifest -ManifestPath $ManifestPath -Changes @{ status = 'rolled_back'; rolled_back_at = (Get-Date).ToUniversalTime().ToString('o') }
+}
+
+function Test-UninitializedTransactionRuntime {
+    param([string]$InstallRoot, $Manifest, [bool]$TaskInstalled)
+    if ($Manifest.status -ne 'prepared' -or $TaskInstalled) { return $false }
+    if ($Manifest.PSObject.Properties.Name -notcontains 'runtime_ready' -or $Manifest.runtime_ready -ne $false) { return $false }
+    $FreshInstall = $Manifest.kind -eq 'install'
+    $LegacyV12 = $Manifest.PSObject.Properties.Name -contains 'legacy_kind' -and $Manifest.legacy_kind -eq 'github-v1.2'
+    if (-not $FreshInstall -and -not $LegacyV12) { return $false }
+    if ($Manifest.PSObject.Properties.Name -contains 'guardian_original_intent' -and $null -ne $Manifest.guardian_original_intent) { return $false }
+    if (Test-Path -LiteralPath (Join-Path $InstallRoot 'components\Python313-ProgressWX\python.exe')) { return $false }
+    if (Test-Path -LiteralPath (Join-Path $InstallRoot '.ecosystem\installation.json')) { return $false }
+    foreach ($Relative in @('components', 'components\Python313-ProgressWX', 'components\codex-feishu', 'components\codex-feishu\.state')) {
+        $Path = Join-Path $InstallRoot $Relative
+        if (Test-Path -LiteralPath $Path) {
+            $Item = Get-Item -LiteralPath $Path -Force
+            if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or -not $Item.PSIsContainer) { return $false }
+        }
+    }
+    $State = Join-Path $InstallRoot 'components\codex-feishu\.state'
+    if ((Test-Path -LiteralPath $State) -and @(Get-ChildItem -LiteralPath $State -Force).Count -gt 0) { return $false }
+    $Config = Join-Path $InstallRoot 'components\codex-feishu\config.yaml'
+    $Template = Join-Path $InstallRoot 'components\codex-feishu\config.example.yaml'
+    if (Test-Path -LiteralPath $Config) {
+        if (-not (Test-Path -LiteralPath $Template) -or (Get-FileHash -LiteralPath $Config).Hash -ne (Get-FileHash -LiteralPath $Template).Hash) { return $false }
+    }
+    return (Test-TransactionProcessesAbsent -InstallRoot $InstallRoot)
+}
+
+function Test-TransactionProcessesAbsent {
+    param([string]$InstallRoot)
+    $Prefix = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\') + '\'
+    foreach ($Process in @(Get-CimInstance Win32_Process -ErrorAction Stop)) {
+        if ($Process.ExecutablePath -and ([string]$Process.ExecutablePath).StartsWith($Prefix, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+        if ($Process.Name -match '^python(?:w|[0-9.]*)?\.exe$' -and $Process.CommandLine -and ([string]$Process.CommandLine).IndexOf($InstallRoot, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $false }
+    }
+    return $true
+}
+
+function Test-QuiescedUpgradeRollback {
+    param([string]$InstallRoot, [string]$BackupRoot, $Manifest, $TaskState)
+    if ($Manifest.status -ne 'prepared' -or $Manifest.kind -ne 'upgrade') { return $false }
+    if ($Manifest.PSObject.Properties.Name -notcontains 'legacy_kind' -or $Manifest.legacy_kind -ne 'ecosystem-installed') { return $false }
+    if ($Manifest.PSObject.Properties.Name -notcontains 'runtime_ready' -or $Manifest.runtime_ready -ne $false) { return $false }
+    if ($Manifest.PSObject.Properties.Name -notcontains 'old_services_quiesced' -or $Manifest.old_services_quiesced -ne $true) { return $false }
+    if ($Manifest.PSObject.Properties.Name -notcontains 'old_recovery_suspended' -or $Manifest.old_recovery_suspended -ne $true) { return $false }
+    if ($TaskState.enabled -or $TaskState.legacy_enabled) { return $false }
+    if (-not (Test-TransactionProcessesAbsent -InstallRoot $InstallRoot)) { return $false }
+    $Saved = Join-Path $BackupRoot 'install-root'
+    if (-not (Test-Path -LiteralPath $Saved -PathType Container)) { return $false }
+    Assert-NoReparsePoints -Root $InstallRoot
+    Assert-NoReparsePoints -Root $Saved
+    # These are the exact preserved paths validated before the old service was
+    # stopped. Any new state/configuration activity prevents the exception.
+    foreach ($Relative in @('components\codex-feishu\config.yaml', 'components\codex-feishu\.state')) {
+        $Current = Join-Path $InstallRoot $Relative
+        $Original = Join-Path $Saved $Relative
+        if ((Test-Path -LiteralPath $Current) -ne (Test-Path -LiteralPath $Original)) { return $false }
+        if (-not (Test-Path -LiteralPath $Original)) { continue }
+        foreach ($Root in @($Current, $Original)) {
+            $Item = Get-Item -LiteralPath $Root -Force
+            if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+            if ($Item.PSIsContainer) { Assert-NoReparsePoints -Root $Root }
+        }
+        $CurrentFiles = @(Get-ChildItem -LiteralPath $Current -Recurse -File -Force | Sort-Object FullName | ForEach-Object { $_.FullName.Substring($Current.Length) + ' ' + (Get-FileHash -LiteralPath $_.FullName).Hash })
+        $OriginalFiles = @(Get-ChildItem -LiteralPath $Original -Recurse -File -Force | Sort-Object FullName | ForEach-Object { $_.FullName.Substring($Original.Length) + ' ' + (Get-FileHash -LiteralPath $_.FullName).Hash })
+        if (($CurrentFiles -join "`n") -ne ($OriginalFiles -join "`n")) { return $false }
+    }
+    return $true
+}
+
+function Remove-EcosystemTransactionBackup {
+    param([Parameter(Mandatory = $true)][string]$ManifestPath)
+    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) { return }
+    $Manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
+    if ($Manifest.schema_version -ne 1) { throw '不支持的事务清单版本。' }
+    $BackupRoot = Resolve-SafeLocalRoot -Path ([string]$Manifest.backup_root)
+    if (-not (Test-PathWithinRoot -Path $ManifestPath -Root $BackupRoot)) { throw '事务清单不在声明的备份根内。' }
+    if (-not [IO.Path]::GetFileName($BackupRoot).Equals([string]$Manifest.transaction_id, [StringComparison]::Ordinal)) {
+        throw '事务备份目录与事务 ID 不一致，拒绝清理。'
+    }
+    $BackupFamily = Split-Path -Parent (Split-Path -Parent $BackupRoot)
+    if (-not [IO.Path]::GetFileName($BackupFamily).Equals('.codex-feishu-backups', [StringComparison]::OrdinalIgnoreCase)) {
+        throw '事务备份不在受控目录中，拒绝清理。'
+    }
+    Remove-Item -LiteralPath $BackupRoot -Recurse -Force
+}
+
+function Restore-EcosystemUserData {
+    param([Parameter(Mandatory = $true)][string]$SavedInstallRoot, [Parameter(Mandatory = $true)][string]$InstallRoot)
+    $Config = Join-Path $SavedInstallRoot 'config.json'
+    if (Test-Path -LiteralPath $Config -PathType Leaf) {
+        Copy-Item -LiteralPath $Config -Destination (Join-Path $InstallRoot 'config.json') -Force
+    }
+    $OldState = Join-Path $SavedInstallRoot '.state'
+    if (Test-Path -LiteralPath $OldState -PathType Container) {
+        Copy-TreeChecked -Source $OldState -Destination (Join-Path $InstallRoot '.state')
+    }
+    $OldLogs = Join-Path $SavedInstallRoot 'logs'
+    if (Test-Path -LiteralPath $OldLogs -PathType Container) {
+        Copy-TreeChecked -Source $OldLogs -Destination (Join-Path $InstallRoot 'logs')
+    }
+    $OldPlugins = Join-Path $SavedInstallRoot 'plugins'
+    $NewPlugins = Join-Path $InstallRoot 'plugins'
+    if (Test-Path -LiteralPath $OldPlugins -PathType Container) {
+        New-Item -ItemType Directory -Force -Path $NewPlugins | Out-Null
+        foreach ($Item in Get-ChildItem -LiteralPath $OldPlugins -Force) {
+            $Target = Join-Path $NewPlugins $Item.Name
+            if (Test-Path -LiteralPath $Target) {
+                $ConflictRoot = Join-Path $InstallRoot ('.state\plugin-backups\' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [Guid]::NewGuid().ToString('N'))
+                New-Item -ItemType Directory -Force -Path $ConflictRoot | Out-Null
+                $Preserved = Join-Path $ConflictRoot $Item.Name
+                if ($Item.PSIsContainer) { Copy-TreeChecked -Source $Item.FullName -Destination $Preserved }
+                else { Copy-Item -LiteralPath $Item.FullName -Destination $Preserved -Force }
+                Write-Host '同名旧插件已保存在安装目录 .state\plugin-backups，可手动比较恢复。'
+                continue
+            }
+            if ($Item.PSIsContainer) { Copy-TreeChecked -Source $Item.FullName -Destination $Target }
+            else { Copy-Item -LiteralPath $Item.FullName -Destination $Target -Force }
+        }
+    }
 }
 
 function Set-PrivateAcl {
@@ -265,8 +421,9 @@ function Install-EcosystemFiles {
     Copy-TreeChecked -Source (Join-Path $PackageRoot 'plugins') -Destination (Join-Path $InstallRoot 'plugins')
     Copy-TreeChecked -Source (Join-Path $PackageRoot 'docs') -Destination (Join-Path $InstallRoot 'docs')
     Copy-Item -LiteralPath (Join-Path $PackageRoot 'LICENSE') -Destination (Join-Path $InstallRoot 'LICENSE') -Force
+    Copy-Item -LiteralPath (Join-Path $PackageRoot 'PACKAGE_VERSION.txt') -Destination (Join-Path $InstallRoot 'PACKAGE_VERSION.txt') -Force
     New-Item -ItemType Directory -Force -Path (Join-Path $InstallRoot 'installer') | Out-Null
-    foreach ($Name in @('_common.ps1', 'rollback.ps1', 'uninstall.ps1')) {
+    foreach ($Name in @('_common.ps1', 'rollback.ps1', 'uninstall.ps1', 'guardian-lifecycle.ps1', 'guardian-task.ps1', 'guardian-supervisor.py', 'check-runtime.py')) {
         Copy-Item -LiteralPath (Join-Path $PackageRoot ('installer\' + $Name)) -Destination (Join-Path $InstallRoot ('installer\' + $Name)) -Force
     }
 }
@@ -306,7 +463,7 @@ function Install-PythonRuntime {
     }
     $Version = (& $PythonExe -c 'import platform; print(platform.python_version())').Trim()
     if ($LASTEXITCODE -ne 0 -or $Version -ne '3.13.14') { throw "项目 Python 版本异常：$Version" }
-    $HasPip = (& $PythonExe -c 'import importlib.util; print(int(importlib.util.find_spec("pip") is not None))').Trim()
+    $HasPip = (& $PythonExe (Join-Path $PSScriptRoot 'check-runtime.py') pip).Trim()
     if ($LASTEXITCODE -ne 0) { throw '无法检查项目 Python 的 pip 状态。' }
     if ($HasPip -ne '1') {
         & $PythonExe -m ensurepip --upgrade --default-pip | Out-Host
@@ -356,7 +513,7 @@ function Test-EcosystemHealth {
     }
     if ($SkipRuntimeCheck) { return }
     $ProgressRoot = Join-Path $InstallRoot 'components\codex-feishu'
-    & $PythonExe -c "import sys; sys.path.insert(0, r'$($ProgressRoot.Replace("'", "''"))\src'); import progress_wx, yaml, lark_channel; assert progress_wx.__version__ == '1.5.0'"
+    & $PythonExe (Join-Path $PSScriptRoot 'check-runtime.py') health $ProgressRoot $script:EcosystemVersion
     if ($LASTEXITCODE -ne 0) { throw 'Python 依赖或产品版本健康检查失败。' }
     & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ProgressRoot 'scripts\status.ps1') -ToolsRoot (Join-Path $InstallRoot 'components') | Out-Null
     if ($LASTEXITCODE -notin @(0, 1)) { throw '后台 status 健康检查失败。' }

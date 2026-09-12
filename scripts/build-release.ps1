@@ -1,9 +1,10 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$OutputRoot = (Join-Path (Resolve-Path (Join-Path $PSScriptRoot '..')).Path 'artifacts'),
     [string]$Version = '1.5.0',
     [string]$DotNetPath = '',
     [string]$TreasureChestExe = '',
+    [string]$UpdaterExe = '',
     [string]$PythonInstaller = '',
     [string]$WheelSource = '',
     [string]$SensitiveYaml = '',
@@ -18,7 +19,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 . (Join-Path $RepoRoot 'installer\_common.ps1')
-if ($Version -ne '1.5.0') { throw '当前源码只允许构建 1.5.0。' }
+if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw '版本号必须是 x.y.z。' }
 $OutputRoot = [IO.Path]::GetFullPath($OutputRoot)
 if ([Uri]::new($OutputRoot).IsUnc) { throw '输出必须位于本机磁盘。' }
 $DriveRoot = [IO.Path]::GetPathRoot($OutputRoot)
@@ -63,6 +64,7 @@ function New-PackageTree {
     Copy-RepositorySnapshot -Destination $Destination
     New-Item -ItemType Directory -Force -Path (Join-Path $Destination 'payload\treasure-chest\resources'), (Join-Path $Destination 'payload\offline\wheels') | Out-Null
     Copy-Item -LiteralPath $TreasureChestExe -Destination (Join-Path $Destination 'payload\treasure-chest\TreasureChest.exe') -Force
+    Copy-Item -LiteralPath $UpdaterExe -Destination (Join-Path $Destination 'payload\treasure-chest\Ecosystem.Updater.exe') -Force
     Copy-Item -LiteralPath (Join-Path $RepoRoot 'components\treasure-chest\treasurechest.root') -Destination (Join-Path $Destination 'payload\treasure-chest\treasurechest.root') -Force
     Copy-TreeChecked -Source (Join-Path $RepoRoot 'components\treasure-chest\resources') -Destination (Join-Path $Destination 'payload\treasure-chest\resources')
     Copy-Item -LiteralPath $PythonInstaller -Destination (Join-Path $Destination 'payload\offline\python-3.13.14-amd64.exe') -Force
@@ -75,20 +77,28 @@ function New-PackageTree {
 }
 
 try {
-    & (Join-Path $RepoRoot 'scripts\privacy-scan.ps1') -Root $RepoRoot -SensitiveYaml $SensitiveYaml
+    # 隐私扫描在每个待发布包目录上执行；被 .gitignore 排除的本机运行状态不会进入包。
     & (Join-Path $RepoRoot 'scripts\validate-package-structure.ps1') -Root $RepoRoot
 
     if (-not $SkipBuild) {
-        & (Join-Path $RepoRoot 'components\treasure-chest\scripts\build.ps1') -DotNetPath $DotNetPath
+        & (Join-Path $RepoRoot 'components\treasure-chest\scripts\build.ps1') -DotNetPath $DotNetPath -Version $Version
         if ($LASTEXITCODE -ne 0) { throw 'TreasureChest 构建失败。' }
     }
     if ([string]::IsNullOrWhiteSpace($TreasureChestExe)) {
         $TreasureChestExe = Join-Path $RepoRoot 'components\treasure-chest\build\publish\TreasureChest.exe'
     }
+    if ([string]::IsNullOrWhiteSpace($UpdaterExe)) {
+        $UpdaterExe = Join-Path $RepoRoot 'components\treasure-chest\build\publish\Ecosystem.Updater.exe'
+    }
     if (-not (Test-Path -LiteralPath $TreasureChestExe -PathType Leaf)) { throw '缺少 TreasureChest 发布 EXE。' }
+    if (-not (Test-Path -LiteralPath $UpdaterExe -PathType Leaf)) { throw '缺少独立生态更新器 EXE。' }
     $VersionInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo((Resolve-Path -LiteralPath $TreasureChestExe).Path)
-    if ($VersionInfo.FileVersion -ne '1.5.0.0' -or $VersionInfo.ProductVersion -notlike '1.5.0*') {
+    if ($VersionInfo.FileVersion -ne ($Version + '.0') -or $VersionInfo.ProductVersion -notlike ($Version + '*')) {
         throw "TreasureChest 版本异常：File=$($VersionInfo.FileVersion), Product=$($VersionInfo.ProductVersion)"
+    }
+    $UpdaterVersionInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo((Resolve-Path -LiteralPath $UpdaterExe).Path)
+    if ($UpdaterVersionInfo.FileVersion -ne ($Version + '.0') -or $UpdaterVersionInfo.ProductVersion -notlike ($Version + '*')) {
+        throw "生态更新器版本异常：File=$($UpdaterVersionInfo.FileVersion), Product=$($UpdaterVersionInfo.ProductVersion)"
     }
 
     if ([string]::IsNullOrWhiteSpace($PythonInstaller)) {
@@ -139,7 +149,31 @@ try {
     & (Join-Path $RepoRoot 'scripts\validate-archive.ps1') -ZipPath $FullZip
     & (Join-Path $RepoRoot 'scripts\validate-archive.ps1') -ZipPath $UpgradeZip
 
-    $Outer = @($FullZip, $UpgradeZip) | ForEach-Object {
+    $FullHash = (Get-FileHash -LiteralPath $FullZip -Algorithm SHA256).Hash.ToLowerInvariant()
+    $UpgradeHash = (Get-FileHash -LiteralPath $UpgradeZip -Algorithm SHA256).Hash.ToLowerInvariant()
+    $UpdateManifest = Join-Path $OutputRoot 'ecosystem-update.json'
+    [ordered]@{
+        schema_version = 1
+        ecosystem_version = $Version
+        minimum_upgradable_version = '1.5.0'
+        release_tag = "v$Version"
+        release_notes_url = "https://github.com/yuhengxuxie-create/codex-progress-toolbox/releases/tag/v$Version"
+        packages = [ordered]@{
+            upgrade = [ordered]@{
+                name = [IO.Path]::GetFileName($UpgradeZip)
+                url = "https://github.com/yuhengxuxie-create/codex-progress-toolbox/releases/download/v$Version/$([IO.Path]::GetFileName($UpgradeZip))"
+                sha256 = $UpgradeHash
+                size = (Get-Item -LiteralPath $UpgradeZip).Length
+            }
+            full = [ordered]@{
+                name = [IO.Path]::GetFileName($FullZip)
+                url = "https://github.com/yuhengxuxie-create/codex-progress-toolbox/releases/download/v$Version/$([IO.Path]::GetFileName($FullZip))"
+                sha256 = $FullHash
+                size = (Get-Item -LiteralPath $FullZip).Length
+            }
+        }
+    } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $UpdateManifest -Encoding UTF8
+    $Outer = @($FullZip, $UpgradeZip, $UpdateManifest) | ForEach-Object {
         '{0} *{1}' -f (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant(), [IO.Path]::GetFileName($_)
     }
     Set-Content -LiteralPath (Join-Path $OutputRoot 'SHA256SUMS.txt') -Value $Outer -Encoding UTF8

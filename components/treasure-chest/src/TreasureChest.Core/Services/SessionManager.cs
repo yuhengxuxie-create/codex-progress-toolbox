@@ -26,9 +26,29 @@ public sealed class SessionManager : IDisposable
     private readonly ConcurrentDictionary<string, Runtime> _runtimes = new(StringComparer.OrdinalIgnoreCase);
     private readonly SemaphoreSlim _operationGate = new(1, 1);
     private readonly AppLogger _logger;
+    private readonly IExternalSessionController? _externalController;
     private bool _disposed;
 
-    public SessionManager(AppLogger logger) => _logger = logger;
+    public SessionManager(AppLogger logger, IExternalSessionController? externalController = null)
+    {
+        _logger = logger;
+        _externalController = externalController;
+    }
+    public bool IsExternallyControlled(SessionDefinition session) => _externalController?.Handles(session) == true;
+    public bool ShouldStop(SessionDefinition session) => IsExternallyControlled(session)
+        ? _externalController!.ShouldStop(session) : GetSnapshot(session).Status == SessionStatus.Running;
+    public async Task ExitExternalControllerAsync(CancellationToken cancellationToken = default)
+    {
+        await _operationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_externalController is null) throw new InvalidOperationException("未配置通信守护控制器。");
+            _logger.Info("请求完整退出通信守护；关闭远程救援。");
+            await _externalController.ExitAsync(cancellationToken).ConfigureAwait(false);
+            _logger.Info("通信守护完整退出命令已完成；状态以只读查询为准。");
+        }
+        finally { _operationGate.Release(); }
+    }
     public bool IsPaused { get; set; }
     public event EventHandler<SessionStateChangedEventArgs>? StateChanged;
 
@@ -47,7 +67,7 @@ public sealed class SessionManager : IDisposable
 
     public async Task StartAutoStartSessionsAsync(IEnumerable<SessionDefinition> sessions, CancellationToken cancellationToken = default)
     {
-        foreach (var session in sessions.Where(item => item.Enabled && item.AutoStart))
+        foreach (var session in sessions.Where(item => item.Enabled && item.AutoStart && !IsExternallyControlled(item)))
         {
             if ((await ProbeAsync(session, cancellationToken).ConfigureAwait(false)).Status != SessionStatus.Running)
                 await StartAsync(session, automatic: false, cancellationToken).ConfigureAwait(false);
@@ -60,6 +80,13 @@ public sealed class SessionManager : IDisposable
         try
         {
             if (!session.Enabled) throw new InvalidOperationException("会话已禁用，请先在编辑中启用。");
+            if (IsExternallyControlled(session))
+            {
+                if (automatic) return SetSnapshot(session, await ProbeAsync(session, cancellationToken).ConfigureAwait(false));
+                _logger.Info("请求通信守护启动业务。");
+                await _externalController!.StartAsync(session, cancellationToken).ConfigureAwait(false);
+                return SetSnapshot(session, await ProbeAsync(session, cancellationToken).ConfigureAwait(false));
+            }
             var runtime = GetRuntime(session);
             runtime.ManualStop = false;
             var current = await ProbeAsync(session, cancellationToken).ConfigureAwait(false);
@@ -83,6 +110,12 @@ public sealed class SessionManager : IDisposable
         await _operationGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            if (IsExternallyControlled(session))
+            {
+                _logger.Info("请求通信守护持久停止业务；保留远程救援。");
+                await _externalController!.StopAsync(session, cancellationToken).ConfigureAwait(false);
+                return SetSnapshot(session, await ProbeAsync(session, cancellationToken).ConfigureAwait(false));
+            }
             var runtime = GetRuntime(session);
             runtime.ManualStop = true;
             if (!string.IsNullOrWhiteSpace(session.StopCommand))
@@ -117,7 +150,7 @@ public sealed class SessionManager : IDisposable
         {
             runtime.WasRunning = true;
         }
-        else if (allowAutoRestart && runtime.WasRunning && !runtime.ManualStop && session.Enabled && session.AutoRestart
+        else if (!IsExternallyControlled(session) && allowAutoRestart && runtime.WasRunning && !runtime.ManualStop && session.Enabled && session.AutoRestart
                  && runtime.RestartAttempts < session.MaxRestartAttempts)
         {
             SetSnapshot(session, current);
@@ -145,6 +178,8 @@ public sealed class SessionManager : IDisposable
             return new SessionSnapshot(session.Id, SessionStatus.Disabled, "已禁用", runtime.RestartAttempts, DateTimeOffset.Now);
         try
         {
+            if (IsExternallyControlled(session))
+                return await _externalController!.ProbeAsync(session, cancellationToken).ConfigureAwait(false);
             if (!string.IsNullOrWhiteSpace(session.StatusCommand))
             {
                 var result = await CommandExecutor.RunAsync(session.StatusCommand, session.WorkingDirectory, TimeSpan.FromSeconds(8), cancellationToken)

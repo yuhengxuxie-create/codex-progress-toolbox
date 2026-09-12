@@ -17,6 +17,10 @@ class MessageChannelOfflineError(MessageChannelError):
     """消息渠道已离线且有限重连耗尽。"""
 
 
+class MessageChannelPayloadRejectedError(MessageChannelError):
+    """渠道已明确拒绝消息载荷；可以改用另一种已验证的展示格式。"""
+
+
 @dataclass(frozen=True, slots=True)
 class ChannelAttachment:
     """由渠道官方 SDK 下载并校验过的本地附件。"""
@@ -40,6 +44,12 @@ class ChannelReply:
     message_hash: str = ""
     attachments: tuple[ChannelAttachment, ...] = ()
     attachment_error: str = ""
+    # 仅由受信渠道适配器设置；普通文字/图片消息保持 ``message``。
+    # 管理控制器据此把卡片点击限制在原出站卡片上下文，不能由正文伪造。
+    source_kind: str = "message"
+    action_name: str = ""
+    action_fingerprint: str = ""
+    created_at: int = 0
 
 
 def codex_prompt_for_reply(message: ChannelReply) -> str:

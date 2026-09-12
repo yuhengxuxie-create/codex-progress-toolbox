@@ -6,11 +6,11 @@ namespace TreasureChest.UI;
 internal sealed class ProjectMonitorSettingsDialog : Form
 {
     private readonly ProjectMonitorCliService _monitorService;
-    private readonly CheckBox _automatic = new()
+    private readonly ThemeCheckBox _automatic = new()
     {
         Text = "启用自动监测",
         AutoSize = true,
-        Font = new Font("Microsoft YaHei UI", 11F, FontStyle.Bold),
+        Font = UiTheme.CreateFont(11F, FontStyle.Bold),
         ForeColor = UiTheme.Text,
         Margin = new Padding(0, 8, 0, 10),
     };
@@ -19,7 +19,7 @@ internal sealed class ProjectMonitorSettingsDialog : Form
         AutoSize = false,
         Dock = DockStyle.Top,
         Height = 34,
-        Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold),
+        Font = UiTheme.CreateFont(10F, FontStyle.Bold),
         ForeColor = UiTheme.Muted,
     };
     private readonly Label _description = new()
@@ -50,16 +50,17 @@ internal sealed class ProjectMonitorSettingsDialog : Form
 
     public ProjectMonitorSettingsDialog(ProjectMonitorCliService monitorService)
     {
+        UiTheme.ConfigureDpiAwareForm(this);
         _monitorService = monitorService;
         Text = "监测设置";
         Icon = IconService.LoadAppIcon();
         StartPosition = FormStartPosition.CenterParent;
-        Size = new Size(680, 500);
-        MinimumSize = new Size(620, 480);
+        Size = new Size(760, 560);
+        MinimumSize = new Size(700, 540);
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         MinimizeBox = false;
-        Font = new Font("Microsoft YaHei UI", 9F);
+        Font = UiTheme.CreateFont();
         BackColor = UiTheme.Background;
         BuildLayout();
         WireEvents();
@@ -80,15 +81,15 @@ internal sealed class ProjectMonitorSettingsDialog : Form
         header.Controls.Add(new Label
         {
             Text = "监测设置",
-            ForeColor = Color.White,
-            Font = new Font("Microsoft YaHei UI", 17F, FontStyle.Bold),
+            ForeColor = UiTheme.NavigationText,
+            Font = UiTheme.CreateFont(17F, FontStyle.Bold),
             Dock = DockStyle.Top,
             Height = 40,
         });
         header.Controls.Add(new Label
         {
             Text = "控制 FeiShuBOT 是否自动发现并加入新的 Codex 会话。",
-            ForeColor = Color.FromArgb(203, 213, 236),
+            ForeColor = UiTheme.NavigationMuted,
             Dock = DockStyle.Bottom,
             Height = 28,
         });
@@ -128,15 +129,16 @@ internal sealed class ProjectMonitorSettingsDialog : Form
         card.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
         card.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         card.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
-        card.RowStyles.Add(new RowStyle(SizeType.Absolute, 58));
+        card.RowStyles.Add(new RowStyle(SizeType.Absolute, 104));
         var note = new Label
         {
-            Text = "关闭自动监测不会删除已有自动项：它们继续正常通知，并在原有效期结束后自然退出。手动长期监测始终不受影响。",
+            Text = "关闭自动监测不会删除已有自动项：\n它们继续正常通知，并在原有效期结束后自然退出。\n手动长期监测始终不受影响。",
             AutoSize = false,
             Dock = DockStyle.Fill,
             Padding = new Padding(12, 8, 12, 8),
-            BackColor = Color.FromArgb(237, 241, 250),
+            BackColor = UiTheme.SurfaceAlt,
             ForeColor = UiTheme.Text,
+            TextAlign = ContentAlignment.MiddleLeft,
         };
         _current.Dock = DockStyle.Fill;
         _automatic.Dock = DockStyle.Fill;
@@ -214,8 +216,8 @@ internal sealed class ProjectMonitorSettingsDialog : Form
     private void UpdateDescription()
     {
         _description.Text = _automatic.Checked
-            ? "开启后，FeiShuBOT 会继续自动发现新的项目会话和个人对话，并按 24 小时规则管理自动项。"
-            : "关闭后，FeiShuBOT 不再新增自动项，也不会延长现有自动项的有效时间。";
+            ? "开启后，FeiShuBOT 会继续自动发现新的项目会话和个人对话，\n并按 24 小时规则管理自动项。"
+            : "关闭后，FeiShuBOT 不再新增自动项，\n也不会延长现有自动项的有效时间。";
     }
 
     private void SetBusy(bool busy, string text)

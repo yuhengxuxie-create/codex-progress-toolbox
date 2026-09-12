@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param([string]$PackageRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path)
 
 $ErrorActionPreference = 'Stop'
@@ -16,6 +16,7 @@ $Required = @(
     'components\codex-feishu\progress-wx.py',
     'components\treasure-chest\src\TreasureChest.App\TreasureChest.App.csproj',
     'payload\treasure-chest\TreasureChest.exe',
+    'payload\treasure-chest\Ecosystem.Updater.exe',
     'payload\offline\python-3.13.14-amd64.exe',
     'payload\offline\wheels',
     'installer\install.ps1', 'installer\upgrade.ps1', 'installer\rollback.ps1'

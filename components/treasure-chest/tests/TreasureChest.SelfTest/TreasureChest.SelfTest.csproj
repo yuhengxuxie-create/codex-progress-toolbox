@@ -11,5 +11,6 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\TreasureChest.Core\TreasureChest.Core.csproj" />
     <ProjectReference Include="..\..\src\TreasureChest.App\TreasureChest.App.csproj" />
+    <ProjectReference Include="..\..\src\Ecosystem.Updater\Ecosystem.Updater.csproj" />
   </ItemGroup>
 </Project>

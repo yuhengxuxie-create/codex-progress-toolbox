@@ -24,6 +24,20 @@ class _FileTime(ctypes.Structure):
     _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
 
 
+def _handle_is_active(kernel32: Any, handle: Any) -> bool | None:
+    """区分活动进程与仍可查询时间的已退出内核对象。"""
+
+    kernel32.GetExitCodeProcess.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    exit_code = wintypes.DWORD()
+    if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+        return None
+    return int(exit_code.value) == 259  # STILL_ACTIVE
+
+
 def process_creation_time(pid: int) -> int | None:
     """读取 Windows FILETIME；用于避免 PID 重用后误认或误停其它进程。"""
 
@@ -50,6 +64,8 @@ def process_creation_time(pid: int) -> int | None:
     if not handle:
         return None
     try:
+        if _handle_is_active(kernel32, handle) is not True:
+            return None
         creation, exit_time, kernel, user = _FileTime(), _FileTime(), _FileTime(), _FileTime()
         if not kernel32.GetProcessTimes(
             handle,
@@ -86,6 +102,8 @@ def process_image_path(pid: int) -> Path | None:
     if not handle:
         return None
     try:
+        if _handle_is_active(kernel32, handle) is not True:
+            return None
         capacity = 32768
         buffer = ctypes.create_unicode_buffer(capacity)
         size = wintypes.DWORD(capacity)
@@ -161,8 +179,11 @@ def process_liveness(pid: int) -> str:
     ctypes.set_last_error(0)
     handle = kernel32.OpenProcess(0x1000, False, int(pid))
     if handle:
-        kernel32.CloseHandle(handle)
-        return "running"
+        try:
+            active = _handle_is_active(kernel32, handle)
+        finally:
+            kernel32.CloseHandle(handle)
+        return "running" if active is True else "absent" if active is False else "unknown"
     error = ctypes.get_last_error()
     # ERROR_INVALID_PARAMETER 表示该 PID 不存在；ACCESS_DENIED 等必须视为未知。
     return "absent" if error == 87 else "unknown"
@@ -267,6 +288,85 @@ def read_pid_file(path: Path) -> dict[str, Any] | None:
     ):
         raise InstanceError(f"PID 文件格式错误：{path}")
     return value
+
+
+def channel_health_path(pid_file: Path) -> Path:
+    """返回与服务 PID 文件同目录、同世代校验的脱敏渠道健康文件。"""
+
+    return pid_file.with_name(pid_file.name + ".channel.json")
+
+
+def write_channel_health(
+    pid_file: Path,
+    snapshot: Mapping[str, Any],
+    *,
+    now: float | None = None,
+) -> bool:
+    """原子发布当前服务世代的渠道状态；不包含凭据、URL或异常正文。"""
+
+    state = read_pid_file(pid_file)
+    if state is None or not _state_process_running(state):
+        return False
+    raw_state = str(snapshot.get("state") or "unknown")
+    if raw_state not in {
+        "starting",
+        "connecting",
+        "online",
+        "offline",
+        "failed",
+        "stopping",
+        "stopped",
+        "unknown",
+    }:
+        raw_state = "unknown"
+    timestamp = time.time() if now is None else float(now)
+    retry_seconds = max(0.0, float(snapshot.get("retry_in_seconds") or 0.0))
+    payload = {
+        "schema_version": 1,
+        "pid": int(state["pid"]),
+        "creation_time": int(state["creation_time"]),
+        "channel_state": raw_state,
+        "online": raw_state == "online",
+        "ever_connected": bool(snapshot.get("ever_connected")),
+        "consecutive_failures": max(
+            0, int(snapshot.get("consecutive_failures") or 0)
+        ),
+        "last_failure_class": str(
+            snapshot.get("last_failure_class") or ""
+        )[:80],
+        "last_failure_type": str(snapshot.get("last_failure_type") or "")[:80],
+        "last_transition_at": float(snapshot.get("last_transition_at") or 0.0),
+        "next_retry_at": timestamp + retry_seconds if retry_seconds else None,
+        "updated_at": timestamp,
+    }
+    _atomic_json(channel_health_path(pid_file), payload)
+    return True
+
+
+def read_channel_health(
+    pid_file: Path,
+    *,
+    instance_state: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """只读返回与当前 PID 世代严格匹配的渠道健康快照。"""
+
+    state = dict(instance_state or read_pid_file(pid_file) or {})
+    if not state:
+        return None
+    path = channel_health_path(pid_file)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise InstanceError(f"渠道健康文件损坏：{path}") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or not _same_generation(payload, state)
+    ):
+        return None
+    return payload
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -375,6 +475,7 @@ def acquire_instance(
             path.unlink(missing_ok=True)
         # 必须在发布新 PID 前删除旧停止标记；此时 request_stop 尚不能命中新实例。
         stop_request_path(path).unlink(missing_ok=True)
+        channel_health_path(path).unlink(missing_ok=True)
         pid = os.getpid()
         image = process_image_path(pid)
         if image is None:

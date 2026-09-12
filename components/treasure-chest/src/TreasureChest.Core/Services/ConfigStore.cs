@@ -98,6 +98,10 @@ public sealed class ConfigStore
     {
         if (config.Settings.RefreshIntervalSeconds is < 1 or > 300)
             throw new InvalidDataException("刷新间隔必须为 1 至 300 秒。");
+        if (config.Settings.UpdateCheckIntervalHours is < 1 or > 168)
+            throw new InvalidDataException("更新检查间隔必须为 1 至 168 小时。");
+        if (config.Settings.ThemeMode is not ("day" or "night"))
+            throw new InvalidDataException("界面模式只能是 day 或 night。");
         if (config.Sessions.Any(item => string.IsNullOrWhiteSpace(item.Id) || string.IsNullOrWhiteSpace(item.Name)))
             throw new InvalidDataException("会话 ID 和名称不能为空。");
         if (config.Tools.Any(item => string.IsNullOrWhiteSpace(item.Id) || string.IsNullOrWhiteSpace(item.Name)))
@@ -134,6 +138,12 @@ public sealed class ConfigStore
     private static void Normalize(AppConfiguration config)
     {
         config.Settings ??= new GeneralSettings();
+        config.Settings.UpdateCheckIntervalHours = Math.Clamp(config.Settings.UpdateCheckIntervalHours, 1, 168);
+        config.Settings.UpdateCheckETag ??= string.Empty;
+        config.Settings.LastNotifiedUpdateVersion ??= string.Empty;
+        config.Settings.ThemeMode = string.Equals(config.Settings.ThemeMode?.Trim(), "night", StringComparison.OrdinalIgnoreCase)
+            ? "night"
+            : "day";
         config.Sessions ??= [];
         config.Tools ??= [];
         config.PluginEnabled ??= new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);

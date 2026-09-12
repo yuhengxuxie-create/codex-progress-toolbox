@@ -11,13 +11,15 @@ import os
 import re
 import secrets
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Mapping, Sequence
 
 import yaml
 
@@ -37,7 +39,15 @@ from .codex_gateway import (
     verified_gateway_running,
 )
 from .codex_rpc import CodexAppServer, validate_loopback_websocket_url
-from .codex_store import CodexStore, StorePaths
+from .codex_store import (
+    CodexStore,
+    CodexStoreReadError,
+    StorePaths,
+    ThreadRecord,
+    public_thread_title,
+    thread_title_recovery_hash,
+)
+from .codex_projects import CodexProjectRegistry
 from .config import DEFAULT_CONFIG_PATH, PROJECT_ROOT, ConfigError, load_config
 from .feishu import FeishuMessageChannel, discover_feishu_open_id
 from .installer import install_notify, uninstall_notify
@@ -48,15 +58,24 @@ from .process_control import (
     acquire_instance,
     clear_stop_request,
     instance_running,
+    read_channel_health,
     read_pid_file,
     release_instance,
     request_stop,
     stop_requested_for,
 )
 from .retry import RetryPolicy, call_with_retry
+from .reset_alert import BEIJING, next_check_at as reset_next_check_at
 from .service import ProgressService, snapshot_to_event
 from .secrets import DpapiSecretStore
-from .state import CorrelationCodec, StateStore
+from .state import CorrelationCodec, StateError, StateStore
+from .session_search import (
+    AtomicProgressFile,
+    LunaSemanticJudge,
+    SearchRequest,
+    SessionSearchCancelled,
+    build_session_search_engine,
+)
 from .uia_probe import probe_tool_window
 from .usage import USAGE_IMAGE_FOOTER, feishu_usage_images
 from .wechat import WechatService, WxAutoX4Adapter
@@ -137,6 +156,51 @@ def _parser() -> argparse.ArgumentParser:
     monitor_settings.add_argument(
         "--json", action="store_true", help="只向 stdout 输出 JSON"
     )
+    session_search = sub.add_parser(
+        "session-search", help="从 UTF-8 JSON 请求搜索全部用户 Codex 会话"
+    )
+    session_search.add_argument(
+        "--request-file",
+        required=True,
+        help="UTF-8 request JSON 文件；使用 - 从 stdin 读取",
+    )
+    session_search.add_argument(
+        "--progress-file",
+        required=True,
+        type=Path,
+        help="原子写入、由调用方轮询的 progress JSON 文件",
+    )
+    session_search.add_argument(
+        "--cancel-file",
+        type=Path,
+        help="可选；调用方创建该文件后，搜索会在下一安全检查点取消",
+    )
+    session_search.add_argument(
+        "--cache-mode",
+        choices=("persistent", "ephemeral"),
+        default="persistent",
+        help=(
+            "缓存模式：persistent 写入生产缓存（默认）；ephemeral 使用临时状态副本，"
+            "适合 UI/联调验收且不修改生产状态"
+        ),
+    )
+    session_search.add_argument(
+        "--json", action="store_true", help="兼容显式 JSON 模式；成功 stdout 始终仅 JSON"
+    )
+    repair_titles = sub.add_parser(
+        "repair-thread-titles",
+        help="一次性恢复缺失的历史会话标题；列表刷新本身不会调用模型",
+    )
+    repair_titles.add_argument(
+        "--max-model-calls",
+        type=int,
+        choices=(1, 2, 3),
+        default=3,
+        help="本次最多发起的 Luna 批次，单批最多6条（默认3）",
+    )
+    repair_titles.add_argument(
+        "--json", action="store_true", help="只向 stdout 输出不含标题正文的 JSON"
+    )
     sub.add_parser("install-notify", help="安全安装 Codex notify 包装器")
     sub.add_parser("install-permission-hook", help="安装用户全局飞书审批 Hook")
     sub.add_parser("uninstall-permission-hook", help="只移除本工具的全局飞书审批 Hook")
@@ -147,6 +211,39 @@ def _parser() -> argparse.ArgumentParser:
     stop = sub.add_parser("stop", help="请求服务正常停止，不强杀进程")
     stop.add_argument("--timeout", type=float, default=30)
     sub.add_parser("status", help="显示运行状态和队列统计")
+    sub.add_parser("guardian-run", help=argparse.SUPPRESS)
+    worker = sub.add_parser("worker-run", help=argparse.SUPPRESS)
+    worker.add_argument("--guardian-token", required=True)
+    guardian_status_parser = sub.add_parser("guardian-status", help="只读显示通信守护和业务状态")
+    guardian_status_parser.add_argument("--json", action="store_true")
+    guardian_stop_parser = sub.add_parser("guardian-stop", help="完整退出业务和远程救援")
+    guardian_stop_parser.add_argument("--timeout", type=int, default=30)
+    maintenance = sub.add_parser("guardian-maintenance", help="受控进入或退出升级维护")
+    maintenance_choice = maintenance.add_mutually_exclusive_group(required=True)
+    maintenance_choice.add_argument("--enter", action="store_true")
+    maintenance_choice.add_argument("--leave", action="store_true")
+    maintenance.add_argument("--shutdown-guardian", action="store_true")
+    maintenance.add_argument("--timeout", type=int, default=30)
+    recover = sub.add_parser("guardian-recover", help="按精确实例身份恢复通信守护")
+    recover.add_argument("--expected-pid", type=int, required=True)
+    recover.add_argument("--expected-creation-time", type=int, required=True)
+    recover.add_argument("--reason", choices=("crashed","unresponsive"), required=True)
+    worker_recover = sub.add_parser("worker-recover", help="本机按精确身份恢复无响应业务，保留不确定投递")
+    worker_recover.add_argument("--expected-pid", type=int, required=True)
+    worker_recover.add_argument("--expected-creation-time", type=int, required=True)
+    reset_alert_status = sub.add_parser(
+        "reset-alert-status", help="只读显示 Codex 重置预警运行状态"
+    )
+    reset_alert_status.add_argument(
+        "--json", action="store_true", help="成功时 stdout 仅输出 schema 1 JSON"
+    )
+    reset_alert_latest = sub.add_parser(
+        "reset-alert-latest", help="只读显示最近的 Codex 重置预警事件"
+    )
+    reset_alert_latest.add_argument("--limit", type=int, default=10)
+    reset_alert_latest.add_argument(
+        "--json", action="store_true", help="成功时 stdout 仅输出 schema 1 JSON"
+    )
     gateway_run = sub.add_parser("gateway-run", help=argparse.SUPPRESS)
     gateway_run.add_argument("--launch-token", required=True, help=argparse.SUPPRESS)
     gateway_start = sub.add_parser("gateway-start", help=argparse.SUPPRESS)
@@ -220,6 +317,11 @@ def _parser() -> argparse.ArgumentParser:
         choices=("delivered", "not-delivered"),
         help="已确认投递，或已确认未投递并允许重新排队",
     )
+    artifact_status = sub.add_parser("artifact-status",help="只读查看成果文件投递状态")
+    artifact_status.add_argument("--json",action="store_true")
+    artifact_status.add_argument("--thread-id",default="")
+    artifact_status.add_argument("--offset",type=int,default=0)
+    artifact_status.add_argument("--limit",type=int,default=100)
     sub.add_parser("doctor", help="检查 app-server 和消息渠道依赖，不发送消息")
     configure_feishu = sub.add_parser(
         "configure-feishu", help="安全保存飞书 App ID/Secret，不在命令行暴露 Secret"
@@ -239,7 +341,7 @@ def _parser() -> argparse.ArgumentParser:
     test_feishu.add_argument(
         "--usage-guide",
         action="store_true",
-        help="发送六页可直接预览的课堂图片及文字版提示",
+        help="发送四页可直接预览的课堂图片及文字版提示",
     )
     free_probe = sub.add_parser("probe-free-wechat", help="只读探测指定小号的免费 UIA 能力")
     free_probe.add_argument(
@@ -267,6 +369,12 @@ def _config(args: argparse.Namespace, *, ready: bool = True):
     if ready:
         config.validate_ready()
     return config
+
+
+def _open_read_only_state(path: Path) -> StateStore:
+    """打开现有状态库的硬只读连接；只读命令不得触发迁移。"""
+
+    return StateStore.open_read_only(path)
 
 
 def _update_yaml_scalar(path: Path, section: str, key: str, value: str) -> None:
@@ -394,6 +502,28 @@ def _validate(args: argparse.Namespace) -> int:
         errors.append(str(exc))
     if not paths.state_db.is_file():
         errors.append(f"缺少 {paths.state_db}")
+    else:
+        try:
+            # Codex 的 state_5.sqlite 不是本服务状态库，不能套用 FeiShuBOT
+            # 的 meta/schema17 校验；由 CodexStore 以其自己的只读语义读取。
+            codex_store = CodexStore(paths=paths)
+            codex_store.select_threads(include_archived=True)
+            codex_store.require_readable("Codex 状态只读检查")
+        except (CodexStoreReadError, OSError) as exc:
+            errors.append(f"Codex 状态只读检查失败：{exc}")
+    service = getattr(config, "service", None)
+    service_database = getattr(service, "database", None)
+    if service_database is not None:
+        service_database = Path(service_database).expanduser().resolve()
+        if not service_database.is_file():
+            errors.append(f"缺少 {service_database}")
+        else:
+            try:
+                state = _open_read_only_state(service_database)
+            except (StateError, OSError) as exc:
+                errors.append(f"FeiShuBOT 状态库只读检查失败：{exc}")
+            else:
+                state.close()
     if not paths.history_db.is_file():
         errors.append(f"缺少 {paths.history_db}")
     if config.messaging.backend == "feishu" and importlib.util.find_spec("lark_channel") is None:
@@ -416,31 +546,54 @@ def _validate(args: argparse.Namespace) -> int:
 def _list_threads(args: argparse.Namespace) -> int:
     config = _config(args, ready=False)
     store = CodexStore(paths=StorePaths.from_codex_home(config.codex.home))
-    records = store.select_threads(include_archived=True)
-    projects = _desktop_project_assignments(config.codex.home)
-    if args.json:
-        print(json.dumps([
-            {
-                "id": item.thread_id,
-                "title": item.title,
-                "cwd": item.cwd,
-                "archived": item.archived,
-                "updated_at_ms": item.updated_at_ms,
-                "thread_source": item.thread_source,
-                "project_id": projects.get(item.thread_id, (None, None))[0],
-                "project_name": projects.get(item.thread_id, (None, None))[1],
-            }
-            for item in records
-        ], ensure_ascii=False, indent=2))
-    else:
-        print("ID\t标题\t归属\t工作目录\t已归档")
-        for item in records:
-            project_name = projects.get(item.thread_id, (None, "个人对话"))[1]
-            print(
-                f"{item.thread_id}\t{_cell(item.title)}\t{_cell(project_name)}\t"
-                f"{_cell(item.cwd, 260)}\t{item.archived}"
+    records = [
+        item
+        for item in store.select_threads(include_archived=True)
+        if item.thread_source != "subagent"
+    ]
+    store.require_readable("列出用户 Codex 会话")
+    state = _open_read_only_state(config.service.database)
+    try:
+        projects = _desktop_project_assignments(config.codex.home)
+        items = []
+        for record in records:
+            title, title_origin = _thread_display_title(state, record)
+            items.append(
+                {
+                    "id": record.thread_id,
+                    "title": title,
+                    "title_origin": title_origin,
+                    "cwd": record.cwd,
+                    "archived": record.archived,
+                    "updated_at_ms": record.updated_at_ms,
+                    "thread_source": record.thread_source,
+                    "project_id": projects.get(record.thread_id, (None, None))[0],
+                    "project_name": projects.get(record.thread_id, (None, None))[1],
+                }
             )
-    return 0
+        if args.json:
+            print(json.dumps(items, ensure_ascii=False, indent=2))
+        else:
+            print("ID\t标题\t归属\t工作目录\t已归档")
+            for item in items:
+                project_name = item["project_name"] or "个人对话"
+                print(
+                    f"{item['id']}\t{_cell(item['title'])}\t{_cell(project_name)}\t"
+                    f"{_cell(item['cwd'], 260)}\t{item['archived']}"
+                )
+        return 0
+    finally:
+        state.close()
+
+
+def _thread_display_title(
+    state: StateStore, record: ThreadRecord
+) -> tuple[str, str]:
+    cached = state.thread_title_recovery(
+        record.thread_id, thread_title_recovery_hash(record)
+    )
+    recovered = str(cached.get("display_title") or "") if cached else ""
+    return public_thread_title(record, recovered)
 
 
 def _configure_monitor(args: argparse.Namespace) -> int:
@@ -483,9 +636,13 @@ def _configure_monitor(args: argparse.Namespace) -> int:
     return 0
 
 
-def _monitor_runtime(args: argparse.Namespace):
+def _monitor_runtime(args: argparse.Namespace, *, read_only: bool = False):
     config = _config(args, ready=False)
-    state = StateStore(config.service.database)
+    state = (
+        _open_read_only_state(config.service.database)
+        if read_only
+        else StateStore(config.service.database)
+    )
     codex = CodexStore(paths=StorePaths.from_codex_home(config.codex.home))
     records = codex.select_threads(include_archived=True)
     codex.require_readable("读取 Codex 监测目录")
@@ -496,7 +653,7 @@ def _monitor_runtime(args: argparse.Namespace):
 
 
 def _monitor_list(args: argparse.Namespace) -> int:
-    config, state, _codex, records = _monitor_runtime(args)
+    config, state, _codex, records = _monitor_runtime(args, read_only=True)
     try:
         projects = _desktop_project_assignments(config.codex.home)
         items = []
@@ -505,15 +662,16 @@ def _monitor_list(args: argparse.Namespace) -> int:
             record = records.get(thread_id)
             project = projects.get(thread_id)
             group = project[1] if project is not None else "个人会话"
-            title = (
-                (record.title or record.preview).strip()
-                if record is not None
-                else ""
-            ) or f"任务 {thread_id[:8]}"
+            if record is not None:
+                title, title_origin = _thread_display_title(state, record)
+            else:
+                title = f"任务 {thread_id[:8]}"
+                title_origin = "missing_record"
             items.append(
                 {
                     "thread_id": thread_id,
                     "title": title,
+                    "title_origin": title_origin,
                     "group": group,
                     "project": group,
                     "origin": subscription["origin"],
@@ -556,7 +714,8 @@ def _monitor_add(args: argparse.Namespace) -> int:
         if args.json:
             print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
         else:
-            print(f"已永久手动监测：{record.title or record.preview or thread_id}")
+            title, _title_origin = _thread_display_title(state, record)
+            print(f"已永久手动监测：{title}")
         return 0
     finally:
         state.close()
@@ -586,9 +745,13 @@ def _monitor_remove(args: argparse.Namespace) -> int:
 
 def _monitor_settings(args: argparse.Namespace) -> int:
     config = _config(args, ready=False)
-    state = StateStore(config.service.database)
+    raw_enabled = getattr(args, "auto_enabled", None)
+    state = (
+        _open_read_only_state(config.service.database)
+        if raw_enabled is None
+        else StateStore(config.service.database)
+    )
     try:
-        raw_enabled = getattr(args, "auto_enabled", None)
         if raw_enabled is None:
             settings = state.auto_monitoring_settings()
             payload = {
@@ -615,6 +778,167 @@ def _monitor_settings(args: argparse.Namespace) -> int:
             if not payload["auto_monitoring_enabled"]:
                 print("已有自动项保留至原到期时间；手动长期监测不受影响。")
         return 0
+    finally:
+        state.close()
+
+
+class _SessionSearchProgress:
+    """让每个进度快照都明确当前缓存隔离语义，不改变 schema v1。"""
+
+    def __init__(self, sink: AtomicProgressFile, cache_mode: str):
+        self._sink = sink
+        self._prefix = (
+            "【隔离临时缓存】" if cache_mode == "ephemeral" else "【生产持久缓存】"
+        )
+
+    def write(self, phase: str, current: int, total: int, message: str) -> None:
+        self._sink.write(phase, current, total, f"{self._prefix}{message}")
+
+
+def _session_search(args: argparse.Namespace) -> int:
+    """稳定 CLI：请求正文不进入进程命令行，成功 stdout 只有一个 JSON。"""
+
+    cache_mode = str(getattr(args, "cache_mode", "persistent") or "persistent")
+    progress = _SessionSearchProgress(
+        AtomicProgressFile(args.progress_file), cache_mode
+    )
+    progress.write("starting", 0, 0, "正在校验会话搜索请求")
+    try:
+        if str(args.request_file) == "-":
+            binary_stdin = getattr(sys.stdin, "buffer", None)
+            if binary_stdin is not None:
+                raw = binary_stdin.read(65_537)
+                if len(raw) > 65_536:
+                    raise ConfigError("session-search 请求超过 64 KiB 上限")
+                raw_text = raw.decode("utf-8-sig")
+            else:
+                # 测试替身或少数嵌入环境可能没有 buffer；这条兼容路径仍要求
+                # 调用方交付已正确解码的 Unicode 文本。
+                raw_text = sys.stdin.read(65_537)
+                if len(raw_text.encode("utf-8")) > 65_536:
+                    raise ConfigError("session-search 请求超过 64 KiB 上限")
+        else:
+            request_path = Path(args.request_file).expanduser().resolve()
+            raw = request_path.read_bytes()
+            if len(raw) > 65_536:
+                raise ConfigError("session-search 请求超过 64 KiB 上限")
+            raw_text = raw.decode("utf-8-sig")
+        parsed = json.loads(raw_text)
+        if not isinstance(parsed, dict):
+            raise ConfigError("session-search 请求 JSON 根节点必须是对象")
+        request = SearchRequest.from_mapping(parsed)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        progress.write("failed", 0, 0, "搜索请求无效")
+        raise ConfigError(f"session-search 请求无效：{exc}") from exc
+
+    config = _config(args)
+    temporary: tempfile.TemporaryDirectory[str] | None = None
+    state_path = config.service.database
+    try:
+        if cache_mode == "ephemeral":
+            temporary = tempfile.TemporaryDirectory(
+                prefix="progress-wx-session-search-state-"
+            )
+            state_path = Path(temporary.name) / "isolated-state.sqlite"
+            source_path = Path(config.service.database).expanduser().resolve()
+            # 临时隔离搜索只从生产库读取；正确转义路径并在没有活动 WAL 时
+            # 使用 immutable，避免 SQLite 为这条“只读”连接创建 -shm/-wal。
+            source_uri = f"{source_path.as_uri()}?mode=ro"
+            if not Path(f"{source_path}-wal").exists():
+                source_uri += "&immutable=1"
+            source = sqlite3.connect(source_uri, uri=True, timeout=10)
+            destination = sqlite3.connect(state_path)
+            try:
+                source.backup(destination)
+            finally:
+                destination.close()
+                source.close()
+            progress.write(
+                "starting",
+                0,
+                0,
+                "生产状态已只读复制，后续不会修改生产状态",
+            )
+        state = StateStore(state_path)
+    except BaseException:
+        if temporary is not None:
+            temporary.cleanup()
+        raise
+    try:
+        engine = build_session_search_engine(
+            state=state,
+            codex_store=CodexStore(config.codex.home),
+            codex_home=config.codex.home,
+            summary_config=config.summary,
+            codex_command=config.summary.codex_command or config.codex.command,
+            project_registry=CodexProjectRegistry(
+                config.codex.home / ".codex-global-state.json",
+                config.codex.managed_project_root,
+            ),
+            retry_policy=RetryPolicy(
+                config.service.max_attempts,
+                config.service.retry_delays,
+            ),
+        )
+        try:
+            result = engine.search(
+                request,
+                progress=progress,
+                cancel_file=args.cancel_file,
+            )
+        except SessionSearchCancelled as exc:
+            progress.write("cancelled", 0, 0, "搜索已取消")
+            print(f"错误：{exc}", file=sys.stderr)
+            return 3
+        except BaseException:
+            progress.write("failed", 0, 0, "搜索失败；未返回不可信候选")
+            raise
+        print(json.dumps(result.to_dict(), ensure_ascii=False, separators=(",", ":")))
+        return 0
+    finally:
+        state.close()
+        if temporary is not None:
+            temporary.cleanup()
+
+
+def _repair_thread_titles(args: argparse.Namespace) -> int:
+    """显式、受限地恢复历史异常标题；不会由列表/服务轮询隐式触发。"""
+
+    config = _config(args)
+    state = StateStore(config.service.database)
+    try:
+        engine = build_session_search_engine(
+            state=state,
+            codex_store=CodexStore(config.codex.home),
+            codex_home=config.codex.home,
+            summary_config=config.summary,
+            codex_command=config.summary.codex_command or config.codex.command,
+            project_registry=CodexProjectRegistry(
+                config.codex.home / ".codex-global-state.json",
+                config.codex.managed_project_root,
+            ),
+            retry_policy=RetryPolicy(1, (0.0,)),
+        )
+        # 维护命令以“实际进程尝试”为硬上限；单个批次失败不会嵌套重试并
+        # 悄悄超过用户可预期的额度。
+        engine.judge = LunaSemanticJudge(
+            config.summary.codex_command or config.codex.command,
+            timeout_seconds=config.summary.timeout_seconds,
+            retry_policy=RetryPolicy(1, (0.0,)),
+        )
+        result = engine.repair_missing_titles(
+            max_model_calls=int(args.max_model_calls)
+        )
+        if args.json:
+            print(json.dumps(dict(result), ensure_ascii=False, separators=(",", ":")))
+        else:
+            print(
+                "标题异常总数={total_anomalies}，已缓存={already_recovered}，"
+                "本次恢复={recovered}，剩余={remaining}，Luna调用={model_call_count}".format(
+                    **result
+                )
+            )
+        return 0 if int(result["remaining"]) == 0 else 3
     finally:
         state.close()
 
@@ -691,10 +1015,28 @@ def _uninstall_notify(args: argparse.Namespace) -> int:
 def _run(args: argparse.Namespace) -> int:
     config = _config(args)
     _require_service_backend(config)
+    if config.messaging.backend == "feishu" and getattr(args,"command","") != "worker-run":
+        from .guardian import control
+        return control(config,"start")
+    guardian_token = getattr(args,"guardian_token",None)
+    if config.messaging.backend == "feishu":
+        from .guardian import control_root
+        from .guardian_store import GuardianStore
+        authorization = GuardianStore(control_root(config),readonly=True)
+        try:
+            if not guardian_token or authorization.get("worker_token") != guardian_token or authorization.get("desired_state") != "running":
+                raise RuntimeError("worker_launch_not_authorized")
+        finally:
+            authorization.close()
     logger = configure_logging(config.service.log_dir, config.service.log_retention_days)
     # 单实例锁内已在发布 PID 前清理旧停止文件，避免吞掉新到达的停止请求。
-    pid_state = acquire_instance(config.service.pid_file, config.path)
+    pid_state = acquire_instance(
+        config.service.pid_file,
+        config.path,
+        metadata={"channel_health_schema_version": 1},
+    )
     service = ProgressService(config.path)
+    service.guardian_generation = guardian_token
 
     def watch_stop() -> None:
         while not service.stop_event.wait(0.5):
@@ -727,6 +1069,11 @@ def _background_python() -> Path:
 def _start(args: argparse.Namespace) -> int:
     config = _config(args)
     _require_service_backend(config)
+    if config.messaging.backend == "feishu":
+        from .guardian import control
+        result = control(config,"start")
+        print("服务已就绪。" if result == 0 else "服务未就绪，请检查 guardian-status。")
+        return result
     if instance_running(config.service.pid_file):
         state = read_pid_file(config.service.pid_file)
         print(f"服务已经运行，PID={state['pid'] if state else '?'}")
@@ -764,6 +1111,9 @@ def _start(args: argparse.Namespace) -> int:
 
 def _stop(args: argparse.Namespace) -> int:
     config = _config(args, ready=False)
+    if getattr(getattr(config,"messaging",None),"backend",None) == "feishu":
+        from .guardian import control
+        return control(config,"stop",timeout=max(1,args.timeout))
     if not request_stop(config.service.pid_file):
         print("服务未运行。")
         return 0
@@ -781,16 +1131,276 @@ def _status(args: argparse.Namespace) -> int:
     config = _config(args, ready=False)
     state = read_pid_file(config.service.pid_file)
     running = instance_running(config.service.pid_file) if state else False
-    result: dict[str, object] = {"running": running, "pid": state.get("pid") if state else None}
+    health = (
+        read_channel_health(config.service.pid_file, instance_state=state)
+        if running and state is not None
+        else None
+    )
+    raw_channel_state = str((health or {}).get("channel_state") or "unknown")
+    ever_connected = bool((health or {}).get("ever_connected"))
+    if not running:
+        service_state = "stopped"
+        raw_channel_state = "stopped"
+    elif health is None:
+        service_state = (
+            "connecting"
+            if state is not None and state.get("channel_health_schema_version") == 1
+            else "running"
+        )
+    elif raw_channel_state == "online":
+        service_state = "running"
+    elif ever_connected:
+        service_state = "reconnecting"
+    else:
+        service_state = "connecting"
+    result: dict[str, object] = {
+        "schema_version": 1,
+        "running": running,
+        "pid": state.get("pid") if running and state else None,
+        "service_state": service_state,
+        "channel": {
+            "state": raw_channel_state,
+            "online": bool((health or {}).get("online")),
+            "ever_connected": ever_connected,
+            "consecutive_failures": int(
+                (health or {}).get("consecutive_failures") or 0
+            ),
+            "last_failure_class": str(
+                (health or {}).get("last_failure_class") or ""
+            ),
+            "last_failure_type": str(
+                (health or {}).get("last_failure_type") or ""
+            ),
+            "next_retry_at": _reset_alert_time(
+                (health or {}).get("next_retry_at")
+            ),
+            "updated_at": _reset_alert_time((health or {}).get("updated_at")),
+        },
+    }
     if config.service.database.is_file():
-        store = StateStore(config.service.database)
+        store = _open_read_only_state(config.service.database)
         try:
             result["state"] = store.stats()
             result["state"]["pending_hook_events"] = store.pending_hook_count()
         finally:
             store.close()
+    from .guardian import guardian_status
+    guardian_view = guardian_status(config)
+    result["guardian"] = guardian_view["guardian"]
+    result["worker"] = guardian_view["worker"]
+    result["desired_state"] = guardian_view["desired_state"]
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if running else 1
+
+
+def _guardian_command(args: argparse.Namespace) -> int:
+    from .guardian import control, guardian_status, run_guardian, recover_guardian
+    config = _config(args,ready=False)
+    if args.command == "worker-recover":
+        from .guardian import recover_worker
+        result=recover_worker(config,args.expected_pid,args.expected_creation_time)
+        print(json.dumps(guardian_status(config),ensure_ascii=False))
+        return result
+    if args.command == "guardian-status":
+        print(json.dumps(guardian_status(config),ensure_ascii=False))
+        return 0
+    if args.command == "guardian-run":
+        from .guardian import control_root
+        from .guardian_store import private_directory
+        private_directory(control_root(config))
+        configure_logging(control_root(config)/"logs",7)
+        return run_guardian(config)
+    if args.command == "guardian-recover":
+        result = recover_guardian(config,args.expected_pid,args.expected_creation_time,args.reason)
+        print(json.dumps(guardian_status(config),ensure_ascii=False))
+        return result
+    if args.command == "guardian-stop":
+        return control(config,"exit",timeout=max(1,args.timeout))
+    return control(config,"enter" if args.enter else "leave",timeout=max(1,args.timeout),shutdown_guardian=args.shutdown_guardian)
+
+
+def _reset_alert_time(value: object) -> str | None:
+    if value is None:
+        return None
+    try:
+        timestamp = int(value)
+    except (TypeError, ValueError):
+        return None
+    try:
+        return datetime.fromtimestamp(timestamp, BEIJING).isoformat(timespec="seconds")
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _x_endpoint_status(cursor: Mapping[str, Any], *, now: int) -> dict[str, Any]:
+    endpoints = {}
+    for key in ('syndication', 'oembed', 'x_parent'):
+        value = (cursor.get('x_endpoints') or {}).get(key, {})
+        until = int(value.get('cooldown_until') or 0)
+        unrepresentable = bool(value.get('wait_unrepresentable')) or bool(until and _reset_alert_time(until) is None)
+        cooling = unrepresentable or until > now
+        error = str(value.get('last_error') or '')
+        state = ('cooldown' if cooling else 'retry_due' if error == 'source_http_429' else
+                 'error' if error else 'available' if value.get('last_success_at') else 'never')
+        next_attempt = None
+        if value and not unrepresentable:
+            try:
+                next_attempt = _reset_alert_time(reset_next_check_at(max(now + 1, until) - 1))
+            except (ValueError, OverflowError, OSError):
+                unrepresentable = True
+        endpoints[key] = {'state': state,
+            'retry_not_before': _reset_alert_time(until) if until and not unrepresentable else None,
+            'next_attempt_at': next_attempt, 'last_attempt_at': _reset_alert_time(value.get('last_attempt_at')),
+            'last_success_at': _reset_alert_time(value.get('last_success_at')),
+            'consecutive_429': int(value.get('consecutive_429') or 0),
+            'cooldown_basis': str(value.get('cooldown_basis') or ''),
+            'last_error_code': error or None, 'retry_unrepresentable': unrepresentable}
+    fallback = cursor.get('forecast_discovery') or {}
+    verification = cursor.get('official_verification') or {}
+    verified = int(verification.get('verified_count') or 0)
+    attempted = bool(verification.get('attempted'))
+    return {'x_endpoint_states': endpoints,
+        'fallback_discovery': {'source': 'forecast',
+            'state': ('unknown' if not fallback else 'available' if fallback.get('success') else 'unavailable'),
+            'candidate_count': fallback.get('candidate_count'),
+            'checked_at': _reset_alert_time(fallback.get('checked_at'))},
+        'official_verification': {
+            'state': ('unknown' if not verification else 'verified' if verification.get('live_verified_count') else
+                      'cached' if verified else 'unavailable' if verification.get('error_code') else 'not_needed'),
+            'attempted': attempted, 'verified_count': verification.get('verified_count'),
+            'live_verified_count': verification.get('live_verified_count'),
+            'last_error_code': verification.get('error_code') or None}}
+
+
+def _reset_alert_status(args: argparse.Namespace) -> int:
+    config = _config(args, ready=False)
+    store = _open_read_only_state(config.service.database)
+    try:
+        status = store.reset_alert_status()
+    finally:
+        store.close()
+    sources = []
+    for item in status.get("sources", []):
+        cursor = json.loads(str(item.get("cursor_json") or "{}"))
+        sources.append(
+            {
+                "source": str(item.get("source_id") or ""),
+                "health": str(item.get("health") or "never"),
+                "last_check_at": _reset_alert_time(item.get("last_attempt_at")),
+                "last_success_at": _reset_alert_time(item.get("last_success_at")),
+                "last_item_at": _reset_alert_time(item.get("last_item_at")),
+                "baseline_ready": item.get("baseline_completed_at") is not None,
+                "last_error_code": item.get("last_error_code"),
+                "coverage": "degraded" if item.get("health") != "ok" or cursor.get("syndication_error") else "available",
+                "discovery_error_code": cursor.get("syndication_error"),
+                **(_x_endpoint_status(cursor, now=int(time.time()))
+                   if item.get('source_id') == 'x_thsottiaux' else {}),
+            }
+        )
+    available = bool(status.get("available"))
+    payload = {
+        "schema_version": 1,
+        "available": available,
+        "enabled": bool(config.reset_alert.enabled and status.get("enabled")),
+        "can_alert": bool(
+            available
+            and config.reset_alert.enabled
+            and status.get("enabled")
+            and status.get("worker_running")
+            and any(item["health"] == "ok" and item["source"] != "forecast" for item in sources)
+        ),
+        "worker_running": bool(status.get("worker_running")),
+        "worker_started_at": _reset_alert_time(status.get("worker_started_at")),
+        "worker_heartbeat_at": _reset_alert_time(status.get("worker_heartbeat_at")),
+        "worker_stopped_at": _reset_alert_time(status.get("worker_stopped_at")),
+        "state": str(status.get("state") or "unknown"),
+        "timezone": "UTC+08:00",
+        "check_hours": list(range(8, 24)),
+        "last_check_at": _reset_alert_time(status.get("last_attempt_at")),
+        "last_success_at": _reset_alert_time(status.get("last_success_at")),
+        "next_check_at": _reset_alert_time(status.get("next_check_at")),
+        "window_start_at": _reset_alert_time(status.get("window_start_at")),
+        "window_end_at": _reset_alert_time(status.get("window_end_at")),
+        "pending": int(status.get("pending") or 0),
+        "uncertain": int(status.get("uncertain") or 0),
+        "last_error_code": status.get("last_error_code"),
+        "source_states": sources,
+        "coverage": "available" if sources and all(item["coverage"] == "available" for item in sources) else "degraded",
+    }
+    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    return 0
+
+
+def _reset_alert_delivery_contract(raw: dict[str, object]) -> dict[str, object]:
+    delivery = dict(raw)
+    state = str(delivery.get("state") or "pending")
+    terminal = state in {"delivered", "rejected", "uncertain", "expired"}
+    if state == "delivered":
+        consumer_state = "delivered"
+    elif state in {"rejected", "expired"}:
+        consumer_state = "failed"
+    elif state == "uncertain":
+        consumer_state = "needs_attention"
+    else:
+        consumer_state = "wait"
+    delivery.update(
+        {
+            "terminal": terminal,
+            "consumable": terminal,
+            "consumer_state": consumer_state,
+        }
+    )
+    return delivery
+
+
+def _reset_alert_latest(args: argparse.Namespace) -> int:
+    if not 1 <= int(args.limit) <= 100:
+        raise ConfigError("reset-alert-latest --limit 必须介于 1 和 100")
+    config = _config(args, ready=False)
+    store = _open_read_only_state(config.service.database)
+    try:
+        status = store.reset_alert_status()
+        items = store.latest_reset_alerts(limit=int(args.limit))
+    finally:
+        store.close()
+
+    now = int(time.time())
+    payload = {
+        "schema_version": 1,
+        "available": bool(status.get("available")),
+        "items": [
+            {
+                "event_id": item["event_key"],
+                "event_key": item["event_key"],
+                "level": item["level"],
+                "evidence": item["evidence"],
+                "window": item["window"],
+                "advice": item["advice"],
+                "created_at": _reset_alert_time(item["created_at"]),
+                "expires_at": _reset_alert_time(item["expires_at"]),
+                "notified_at": _reset_alert_time(item["notified_at"]),
+                **_reset_alert_notification_contract(item, available=bool(status.get("available")), now=now),
+                "delivery": _reset_alert_delivery_contract(item["delivery"]),
+            }
+            for item in items
+        ],
+    }
+    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    return 0
+
+
+def _reset_alert_notification_contract(item: dict[str, object], *, available: bool, now: int) -> dict[str, object]:
+    parts = str(item.get("event_key") or "").split(":")
+    phase = parts[1] if len(parts) == 3 and parts[1] in {
+        "upcoming", "announced_available", "watch"
+    } else "legacy"
+    try:
+        valid = item.get("level") in {"A", "B"} and int(item.get("expires_at") or 0) > 0
+        active = valid and int(item["expires_at"]) > now
+    except (TypeError, ValueError):
+        valid = active = False
+    reason = "unavailable" if not available else "invalid" if not valid else "active" if active else "expired"
+    return {"phase": phase, "notification_eligible": reason == "active", "eligibility_reason": reason}
 
 
 def _gateway_run(args: argparse.Namespace) -> int:
@@ -1184,6 +1794,9 @@ def _pair_feishu(args: argparse.Namespace) -> int:
     """用一次性正文把手机用户 open_id 精确写入白名单。"""
 
     config = _config(args, ready=False)
+    from .guardian import control_root
+    if instance_running(control_root(config)/"guardian.pid") or instance_running(config.service.pid_file):
+        raise ConfigError("请先完整退出机器人后再重新绑定，避免两个长连接竞争消息。")
     if not re.fullmatch(r"cli_[A-Za-z0-9]+", config.feishu.app_id):
         raise ConfigError("请先运行飞书配置，保存有效 App ID")
     app_secret = DpapiSecretStore(config.feishu.app_secret_file).load()
@@ -1226,6 +1839,12 @@ def _test_feishu(args: argparse.Namespace) -> int:
         retry_delays=config.service.retry_delays,
         error_handler=errors.append,
     )
+    from .guardian import control_root
+    if instance_running(control_root(config)/"guardian.pid"):
+        from .guardian_channel import GuardianChannel
+        channel = GuardianChannel(config,"manual-test",passive=True)
+    elif instance_running(config.service.pid_file):
+        raise ConfigError("旧业务服务仍运行，请通过受控升级切换守护后再测试，不能另开长连接。")
     # 测试命令也必须沿用生产服务的有限重试边界；FeishuMessageChannel 的
     # 首次连接不在内部重试，故这里仅包一层，避免嵌套后放大为 25 次。
     policy = RetryPolicy(config.service.max_attempts, config.service.retry_delays)
@@ -1396,6 +2015,27 @@ def _verify_wechat(args: argparse.Namespace) -> int:
     return 0
 
 
+def _artifact_status(args):
+    config=_config(args,ready=False)
+    from .state import StateStore
+    store=StateStore(config.service.database,mode="ro",migrate=False)
+    try:
+        with store._lock:
+            tables={r[0] for r in store._connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if 'artifact_file_deliveries' not in tables:
+                result={'available':False,'reason':'schema_before_artifact_delivery','rows':[]}
+            else:
+                where=' WHERE thread_id=?' if args.thread_id else ''
+                params=(args.thread_id,) if args.thread_id else ()
+                total=store._connection.execute('SELECT COUNT(*) FROM artifact_file_deliveries'+where,params).fetchone()[0]
+                rows=store._connection.execute('SELECT delivery_id,thread_id,turn_id,file_name,media_kind,sha256,size,state,reason,attempts,notice_state,notice_reason,notice_key FROM artifact_file_deliveries'+where+' ORDER BY created,ordinal LIMIT ? OFFSET ?',(*params,max(1,min(args.limit,500)),max(0,args.offset))).fetchall()
+                result={'available':True,'total':total,'offset':max(0,args.offset),'rows':[dict(row) for row in rows]}
+        print(json.dumps(result,ensure_ascii=False,indent=2))
+        return 0
+    finally:
+        store.close()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     _configure_console()
     args = _parser().parse_args(argv)
@@ -1407,15 +2047,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         "monitor-add": _monitor_add,
         "monitor-remove": _monitor_remove,
         "monitor-settings": _monitor_settings,
+        "session-search": _session_search,
+        "repair-thread-titles": _repair_thread_titles,
         "install-notify": _install_notify,
         "install-permission-hook": _install_permission_hook,
         "permission-hook": _permission_hook,
         "uninstall-permission-hook": _uninstall_permission_hook,
         "uninstall-notify": _uninstall_notify,
         "run": _run,
+        "worker-run": _run,
+        "guardian-run": _guardian_command,
+        "guardian-status": _guardian_command,
+        "guardian-stop": _guardian_command,
+        "guardian-maintenance": _guardian_command,
+        "guardian-recover": _guardian_command,
+        "worker-recover": _guardian_command,
         "start": _start,
         "stop": _stop,
         "status": _status,
+        "reset-alert-status": _reset_alert_status,
+        "reset-alert-latest": _reset_alert_latest,
         "gateway-run": _gateway_run,
         "gateway-start": _gateway_start,
         "gateway-recover-owned": _gateway_recover_owned,
@@ -1425,6 +2076,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "baseline-pre-activation-hooks": _baseline_pre_activation_hooks,
         "discard-stale-pending-replies": _discard_stale_pending_replies,
         "resolve-uncertain": _resolve_uncertain,
+        "artifact-status": _artifact_status,
         "doctor": _doctor,
         "configure-feishu": _configure_feishu,
         "pair-feishu": _pair_feishu,

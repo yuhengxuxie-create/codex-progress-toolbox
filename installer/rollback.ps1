@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param([Parameter(Mandatory = $true)][string]$TransactionManifest)
 
 $ErrorActionPreference = 'Stop'
@@ -8,9 +8,13 @@ Set-StrictMode -Version Latest
 $Before = Get-Content -LiteralPath $TransactionManifest -Raw | ConvertFrom-Json
 Restore-EcosystemTransaction -ManifestPath $TransactionManifest
 
-if ([bool]$Before.legacy_service_was_running -and [bool]$Before.source_existed) {
+$HadGuardianIntent = $Before.PSObject.Properties.Name -contains 'guardian_original_intent' -and $null -ne $Before.guardian_original_intent
+if (-not $HadGuardianIntent -and [bool]$Before.legacy_service_was_running -and [bool]$Before.source_existed) {
     $InstallRoot = [string]$Before.install_root
-    $ProgressRoot = Join-Path $InstallRoot 'components\ProgressChecking(WX)'
+    $ProgressRoot = Join-Path $InstallRoot 'components\codex-feishu'
+    if (-not (Test-Path -LiteralPath (Join-Path $ProgressRoot 'progress-wx.py') -PathType Leaf)) {
+        $ProgressRoot = Join-Path $InstallRoot 'components\ProgressChecking(WX)'
+    }
     $Python = Join-Path $InstallRoot 'components\Python313-ProgressWX\python.exe'
     $Config = Join-Path $ProgressRoot 'config.yaml'
     if ((Test-Path -LiteralPath $Python -PathType Leaf) -and (Test-Path -LiteralPath $Config -PathType Leaf)) {

@@ -1,29 +1,32 @@
 using TreasureChest.Integrations;
+using TreasureChest.Services;
 
 namespace TreasureChest.UI;
 
 internal sealed class ThreadIdDialog : Form
 {
-    private readonly TextBox _value = new() { Width = 560, Height = 90, Multiline = true, ScrollBars = ScrollBars.Vertical };
+    private readonly TextBox _value = new ThemedEmbeddedTextBox { Width = 560, Height = 90, Multiline = true, ScrollBars = ScrollBars.Vertical };
 
     public ThreadIdDialog()
     {
+        UiTheme.ConfigureDpiAwareForm(this);
         Text = "添加监听任务";
         StartPosition = FormStartPosition.CenterParent;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         MinimizeBox = false;
         Size = new Size(720, 310);
-        Font = new Font("Microsoft YaHei UI", 9F);
+        Font = UiTheme.CreateFont();
         BackColor = UiTheme.Background;
+        Icon = IconService.LoadAppIcon();
 
         var layout = new FlowLayoutPanel
         {
             Dock = DockStyle.Fill, Padding = new Padding(24), FlowDirection = FlowDirection.TopDown, WrapContents = false,
         };
-        layout.Controls.Add(new Label { Text = "手动粘贴 Codex 任务链接或任务 ID", AutoSize = true, Font = new Font("Microsoft YaHei UI", 11F, FontStyle.Bold) });
+        layout.Controls.Add(new Label { Text = "手动粘贴 Codex 任务链接或任务 ID", AutoSize = true, Font = UiTheme.CreateFont(11F, FontStyle.Bold) });
         layout.Controls.Add(new Label { Text = "可输入多个，以换行或逗号分隔；添加后会设为手动监测，不受 24 小时自动移除规则影响。", AutoSize = true, ForeColor = UiTheme.Muted, Margin = new Padding(0, 5, 0, 10) });
-        layout.Controls.Add(_value);
+        layout.Controls.Add(new ThemedInputHost(_value) { Width = 560, Height = 90, Margin = Padding.Empty });
         var buttons = new FlowLayoutPanel { AutoSize = true, FlowDirection = FlowDirection.LeftToRight, Margin = new Padding(0, 16, 0, 0) };
         var add = UiTheme.Button("添加", true);
         var cancel = UiTheme.Button("取消");

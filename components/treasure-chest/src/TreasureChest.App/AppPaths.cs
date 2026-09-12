@@ -5,6 +5,7 @@ internal static class AppPaths
     public static string Root { get; } = FindRoot();
     public static string ConfigFile => Path.Combine(Root, "config.json");
     public static string LogFile => Path.Combine(Root, "logs", "TreasureChest.log");
+    public static string ResetAlertConsumerStateFile => Path.Combine(Root, ".state", "reset-alert-consumer.json");
     public static string ProgressNotificationRoot { get; } = FindProgressNotificationRoot();
     public static string ProgressPythonPath { get; } = FindProgressPythonPath();
 

@@ -72,11 +72,12 @@ def test_next_step_wizard_never_sends_or_starts_directly() -> None:
     assert "production-preflight.json" in text
 
 
-def test_away_ready_only_stops_and_removes_exact_task() -> None:
+def test_away_ready_exits_guardian_and_delegates_owned_task_disable() -> None:
     text = _script("one-click-away-ready.ps1")
-    assert "-Command 'stop'" in text
+    assert "-Command 'guardian-stop'" in text
     assert "-Command 'status'" in text
-    assert "-TaskName 'ProgressCheckingWX'" in text
+    assert "disable-autostart.ps1" in text
+    assert "Unregister-ScheduledTask" not in text
     assert "-Command 'start'" not in text
     assert "test-wechat" not in text
     assert "wxautox4" not in text
@@ -186,9 +187,13 @@ def test_autostart_does_not_bypass_five_attempt_fail_stop() -> None:
     """Windows 不得在服务已停机求助后无条件复活它。"""
 
     text = _script("enable-autostart.ps1")
-    assert "-RestartCount 0" in text
-    assert "-AtLogOn" in text
-    assert "-MultipleInstances IgnoreNew" in text
+    assert "-Mode Install" in text and "-Enabled" in text
+    assert "Get-GuardianTaskLocation" in text
+    assert "Register-ScheduledTask" not in text
+    assert "-Command 'start'" not in text
+    helper = _script("guardian-autostart-common.ps1")
+    assert "guardian-task.ps1" in helper
+    assert "throw" in helper
 
 
 def test_feishu_runtime_lock_is_hashed_and_excludes_unused_openapi_package() -> None:
@@ -433,6 +438,7 @@ Write-Output 'child-scope-ok'
         text=True,
         timeout=15,
         check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     assert result.returncode == 0, result.stderr
     assert "child-scope-ok" in result.stdout
@@ -533,6 +539,7 @@ Write-Output 'exit-race-ok'
         text=True,
         timeout=15,
         check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     assert result.returncode == 0, result.stderr
     assert "exit-race-ok" in result.stdout
@@ -632,6 +639,7 @@ def _run_temp_recovery(
             stderr=subprocess.DEVNULL,
             timeout=10,
             check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     finally:
         if writer is not None:

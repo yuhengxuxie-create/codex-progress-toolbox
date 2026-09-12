@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 
 import pytest
 
 from progress_wx.config import SummaryConfig
-from progress_wx.models import ProgressReport, TurnEvent
+from progress_wx.models import NotificationReason, ProgressReport, TurnEvent
 from progress_wx.summarizer import (
+    FALLBACK_DETAILS_MAX_CHARS,
+    SUMMARY_DETAILS_MAX_CHARS,
     SUMMARY_CACHE_MAX_ENTRIES,
     ProgressSummarizer,
     SummaryCancelled,
     SummaryError,
+    fallback_report,
 )
 
 
@@ -59,31 +63,88 @@ def test_external_summary_cache_is_bounded(monkeypatch) -> None:
     assert f"thread-1:turn-{SUMMARY_CACHE_MAX_ENTRIES + 19}:completed" in summarizer._cache
 
 
-def test_short_clear_final_response_is_preserved_instead_of_rewritten(monkeypatch) -> None:
+def test_short_clear_final_response_still_requires_notification_decision(monkeypatch) -> None:
     summarizer = ProgressSummarizer(config("openai_compatible"))
-    rewritten = (
-        "本轮完成：提出移动端原生分开发送方案。\n"
-        "关键结果：图片与文字转交同一会话。\n"
-        "剩余事项：尚待确认。"
-    )
+    calls = 0
+
+    def decide(_event):
+        nonlocal calls
+        calls += 1
+        return ProgressReport(
+            "完成",
+            "整项任务已经完成。",
+            NotificationReason.CONVERSATION_COMPLETE,
+        )
+
     monkeypatch.setattr(
         summarizer,
         "_request",
-        lambda _event: ProgressReport("路线选择", rewritten),
+        decide,
     )
-    original = (
-        "手机端可以分开发：先引用机器人消息发送图片，再直接发送文字说明，"
-        "机器人会自动把图片和文字合并到同一个 Codex 会话。"
-        "如果只有图片就发“.发送”，不想发了就发“.取消”。"
-    )
+    original = "先发图片，再发文字，机器人会自动把两条消息合并到同一个 Codex 会话。"
 
     report = summarizer.summarize(
         TurnEvent("thread-1", "turn-plain", "completed", final_message=original)
     )
 
-    assert report.status == "路线选择"
-    assert report.details == original
-    assert "本轮完成" not in report.details
+    assert calls == 1
+    assert report.status == "完成"
+    assert report.notification_reason == "conversation_complete"
+
+
+def test_detailed_final_response_keeps_semantic_summary_instead_of_original(monkeypatch) -> None:
+    summarizer = ProgressSummarizer(config("openai_compatible"))
+    concise = (
+        "心跳通知补丁已完成并通过测试。朋友退出百宝箱后运行安装脚本即可；"
+        "补丁会自动备份、自检并恢复服务，不影响原有配置和数据。"
+    )
+    monkeypatch.setattr(
+        summarizer,
+        "_request",
+        lambda _event: ProgressReport("补丁完成，等待安装验证", concise),
+    )
+    original = (
+        "小补丁已经做好，可以直接发给朋友。\n"
+        "下载路径：D:/Software/Tool/share/codex-feishu-hotfix.zip\n"
+        "SHA-256：1dbda1bc1a4b47eeea70a66445ae43ca1bedee4095b182654884d3fc066fa37b\n"
+        "朋友需要先退出百宝箱，然后解压补丁并运行 apply-hotfix.ps1。"
+        "脚本会自动备份、自检并恢复服务，不会改动原有配置和数据。"
+    )
+
+    report = summarizer.summarize(
+        TurnEvent("thread-1", "turn-detailed", "completed", final_message=original)
+    )
+
+    assert report.status == "补丁完成，等待安装验证"
+    assert report.details == concise
+    assert "D:/Software" not in report.details
+    assert "SHA-256" not in report.details
+
+
+@pytest.mark.parametrize(
+    "original",
+    [
+        "补丁位于 D:/Software/Tool/hotfix.zip，请运行安装脚本。",
+        "请运行 `apply-hotfix.ps1`，完成后回复结果。",
+        "- 已生成补丁\n- 请安装后测试",
+    ],
+)
+def test_short_but_technical_response_is_still_summarized(
+    monkeypatch,
+    original: str,
+) -> None:
+    summarizer = ProgressSummarizer(config("openai_compatible"))
+    monkeypatch.setattr(
+        summarizer,
+        "_request",
+        lambda _event: ProgressReport("等待安装验证", "补丁已就绪，请安装后测试。"),
+    )
+
+    report = summarizer.summarize(
+        TurnEvent("thread-1", "turn-technical", "completed", final_message=original)
+    )
+
+    assert report.details == "补丁已就绪，请安装后测试。"
 
 
 def test_rate_limit_wait_can_be_cancelled_before_network(monkeypatch) -> None:
@@ -101,6 +162,66 @@ def test_rate_limit_wait_can_be_cancelled_before_network(monkeypatch) -> None:
             TurnEvent("thread-1", "turn-2", "completed"),
             wait=lambda _seconds: True,
         )
+
+
+def test_running_codex_cli_summary_is_terminated_when_service_stops(
+    monkeypatch,
+) -> None:
+    local = config("codex_cli")
+    summarizer = ProgressSummarizer(local)
+    observed: dict[str, object] = {}
+
+    class Stream:
+        def close(self) -> None:
+            observed.setdefault("closed", 0)
+            observed["closed"] = int(observed["closed"]) + 1
+
+    class Process:
+        returncode = None
+
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.stdin = Stream()
+            self.stdout = Stream()
+            self.stderr = Stream()
+            self.terminated = False
+            observed["process"] = self
+
+        def communicate(self, *, input=None, timeout=None):
+            del input, timeout
+            raise subprocess.TimeoutExpired("codex", 0.25)
+
+        def poll(self):
+            return None if not self.terminated else 0
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def wait(self, timeout=None):
+            del timeout
+            self.returncode = 0
+            return 0
+
+        def kill(self) -> None:
+            self.terminated = True
+
+    monkeypatch.setattr("progress_wx.summarizer.shutil.which", lambda _name: "codex")
+    monkeypatch.setattr("progress_wx.summarizer.subprocess.Popen", Process)
+
+    with pytest.raises(SummaryCancelled, match="正在运行"):
+        summarizer.summarize(
+            TurnEvent(
+                "thread-cancel-running",
+                "turn-cancel-running",
+                "completed",
+                final_message="需要模型处理的复杂技术答复，包含脚本和路径 D:/tmp/run.ps1。",
+            ),
+            wait=lambda _seconds: True,
+        )
+
+    process = observed["process"]
+    assert isinstance(process, Process)
+    assert process.terminated is True
+    assert observed["closed"] == 3
 
 
 def test_loopback_responses_request_is_strict_and_not_stored(monkeypatch) -> None:
@@ -125,7 +246,11 @@ def test_loopback_responses_request_is_strict_and_not_stored(monkeypatch) -> Non
                 {
                     "status": "completed",
                     "output_text": json.dumps(
-                        {"status": "待人工测试", "details": "请运行本地验收。"},
+                        {
+                            "status": "待人工测试",
+                            "details": "请运行本地验收。",
+                            "notification_reason": "user_action_required",
+                        },
                         ensure_ascii=False,
                     ),
                 },
@@ -146,7 +271,12 @@ def test_loopback_responses_request_is_strict_and_not_stored(monkeypatch) -> Non
     )
 
     report = ProgressSummarizer(local).summarize(
-        TurnEvent("thread-1", "turn-1", "completed", final_message="结果")
+        TurnEvent(
+            "thread-1",
+            "turn-1",
+            "completed",
+            final_message="需要语义摘要的复杂技术结果：`apply-hotfix.ps1` 已生成。",
+        )
     )
 
     assert report.status == "待人工测试"
@@ -167,13 +297,20 @@ def test_remote_summary_requires_environment_api_key(monkeypatch) -> None:
 
 
 def test_custom_status_is_allowed_by_summary_schema() -> None:
-    from progress_wx.models import PROGRESS_DETAILS_MAX_CHARS
     from progress_wx.summarizer import _SCHEMA
 
     status_schema = _SCHEMA["properties"]["status"]
     assert "enum" not in status_schema
     assert status_schema["maxLength"] == 20
-    assert _SCHEMA["properties"]["details"]["maxLength"] == PROGRESS_DETAILS_MAX_CHARS
+    assert _SCHEMA["properties"]["details"]["maxLength"] == SUMMARY_DETAILS_MAX_CHARS
+    assert _SCHEMA["properties"]["notification_reason"]["enum"] == [
+        "silent",
+        "answer_ready",
+        "review_ready",
+        "important_update",
+        "user_action_required",
+        "task_complete",
+    ]
     assert ProgressReport("等待第三方响应", "详细说明").status == "等待第三方响应"
 
 
@@ -203,7 +340,11 @@ def test_codex_cli_uses_isolated_luna_and_strict_schema(monkeypatch) -> None:
         output = Path(argv[argv.index("--output-last-message") + 1])
         output.write_text(
             json.dumps(
-                {"status": "待人工测试", "details": "- 请运行验收\n- 回复结果"},
+                {
+                    "status": "待人工测试",
+                    "details": "- 请运行验收\n- 回复结果",
+                    "notification_reason": "user_action_required",
+                },
                 ensure_ascii=False,
             ),
             encoding="utf-8",
@@ -222,6 +363,7 @@ def test_codex_cli_uses_isolated_luna_and_strict_schema(monkeypatch) -> None:
 
     assert report.status == "待人工测试"
     assert report.details == "- 请运行验收\n- 回复结果"
+    assert report.notification_reason == "user_action_required"
     argv = captured["argv"]
     assert argv[argv.index("--model") + 1] == "gpt-5.6-luna"
     assert 'model_reasoning_effort="low"' in argv
@@ -233,23 +375,46 @@ def test_codex_cli_uses_isolated_luna_and_strict_schema(monkeypatch) -> None:
     assert "CODEX_API_KEY" not in kwargs["env"]
     assert "旧内容" * 600 not in kwargs["input"]
     assert "请进行验收" in kwargs["input"]
-    assert "不把简单的大白话搞复杂" in kwargs["input"]
-    assert "优先删减，而不是重新概括" in kwargs["input"]
-    assert "不强制使用“本轮完成、关键结果、剩余事项、需要你处理”" in kwargs["input"]
-    assert "通常控制在 80～280 个中文字符" in kwargs["input"]
+    assert "手机上一眼能看懂的大白话" in kwargs["input"]
+    assert "原回复较长时必须重新凝练" in kwargs["input"]
+    assert "不要因为这一轮回复结束就笼统写“完成”" in kwargs["input"]
+    assert "通常控制在 80～220 个中文字符" in kwargs["input"]
 
 
 def test_overlong_summary_details_are_rejected() -> None:
-    from progress_wx.models import PROGRESS_DETAILS_MAX_CHARS
     from progress_wx.summarizer import _validated_report
 
     with pytest.raises(SummaryError, match="内容无效"):
         _validated_report(
             {
                 "status": "完成",
-                "details": "甲" * (PROGRESS_DETAILS_MAX_CHARS + 1),
+                "details": "甲" * (SUMMARY_DETAILS_MAX_CHARS + 1),
+                "notification_reason": "conversation_complete",
             }
         )
+
+
+def test_fallback_report_is_short_and_removes_long_technical_details() -> None:
+    report = fallback_report(
+        TurnEvent(
+            "thread-1",
+            "turn-fallback",
+            "completed",
+            final_message=(
+                "补丁已生成。\n"
+                "路径：D:/Software/Tool/share/codex-feishu-hotfix.zip\n"
+                "链接：https://example.invalid/download\n"
+                "SHA-256：1dbda1bc1a4b47eeea70a66445ae43ca1bedee4095b182654884d3fc066fa37b\n"
+                + "详细说明" * 100
+            ),
+        )
+    )
+
+    assert report.status == "*/*"
+    assert len(report.details) <= FALLBACK_DETAILS_MAX_CHARS
+    assert "D:/Software" not in report.details
+    assert "https://" not in report.details
+    assert "1dbda1bc" not in report.details
 
 
 def test_structured_approval_does_not_consume_codex_cli(monkeypatch) -> None:

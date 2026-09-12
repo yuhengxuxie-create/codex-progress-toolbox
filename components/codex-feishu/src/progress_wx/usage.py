@@ -5,19 +5,17 @@ from __future__ import annotations
 from pathlib import Path
 
 
-USAGE_VERSION = "1.5.0"
+USAGE_VERSION = "2026-09-08"
 USAGE_IMAGE_FOOTER = (
-    "以上为使用说明，如果想要文字版使用说明，请发送“文字版使用说明”哦"
+    "以上为使用说明，如果想要文字版使用说明，请发送“.文字版使用说明”哦"
 )
 _GUIDE_PATH = Path(__file__).resolve().parents[2] / "docs" / "FEISHU_USAGE.md"
-_GUIDE_IMAGE_DIR = _GUIDE_PATH.parent / "assets" / "feishu-usage-classroom"
+_GUIDE_IMAGE_DIR = _GUIDE_PATH.parent / "assets" / "feishu-usage-classroom-20260908"
 _GUIDE_IMAGE_NAMES = (
     "01-important-reminder.png",
-    "02-view-conversations.png",
-    "03-create-conversations.png",
-    "04-continue-conversations.png",
-    "05-send-images.png",
-    "06-manage-monitoring.png",
+    "02-start-task-approved-v7.png",
+    "03-find-task-and-send-image.png",
+    "04-monitor-notifications-and-alerts-v3.png",
 )
 
 
@@ -28,7 +26,7 @@ def feishu_usage_text() -> str:
         markdown = _GUIDE_PATH.read_text(encoding="utf-8")
     except OSError:
         return (
-            f"版本：{USAGE_VERSION}\n"
+            f"说明修订日期：{USAGE_VERSION}\n"
             "执行结果：本机完整使用说明暂不可读。\n"
             "操作说明：请在本机查看 docs/FEISHU_USAGE.md。"
         )
@@ -37,6 +35,8 @@ def feishu_usage_text() -> str:
         line = raw.strip()
         if line.startswith("# "):
             continue
+        if line.startswith("#"):
+            line = line.lstrip("#").strip()
         if not line:
             if lines and lines[-1]:
                 lines.append("")

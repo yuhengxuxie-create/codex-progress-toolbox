@@ -1,6 +1,6 @@
 # 异地与离线安装
 
-普通用户应使用 v1.5.0 full Release，而不是复制某台电脑的运行目录。
+普通用户应使用正式 Release 的 full 安装包；当前 1.6.0 为本地候选，尚未发布。请按生态根目录 README.md 和 UPGRADE.md 操作，而不是复制某台电脑的运行目录。
 
 full 包包含：公共源码、TreasureChest 自包含程序、Python 3.13.14 官方安装器、哈希锁定 wheel、安装器和校验清单。安装前先运行根目录 `installer\verify-package.ps1`；Python 安装器必须具有有效的 Python Software Foundation 数字签名。
 

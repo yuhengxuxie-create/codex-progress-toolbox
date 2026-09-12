@@ -26,7 +26,7 @@ def test_core_runtime_is_exactly_pinned_and_hashed() -> None:
     lines = _effective_lines(PROJECT_ROOT / "requirements-core.txt")
     assert all(LOCKED_REQUIREMENT.fullmatch(line) for line in lines)
     names = {line.split("==", 1)[0].lower() for line in lines}
-    assert names == {"pyyaml", "websocket-client"}
+    assert names == {"pillow", "pyyaml", "websocket-client"}
 
 
 def test_feishu_lock_includes_core_and_hashes_every_package() -> None:

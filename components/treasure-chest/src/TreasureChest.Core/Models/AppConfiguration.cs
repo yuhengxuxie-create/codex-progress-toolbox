@@ -10,7 +10,7 @@ public sealed class AppConfiguration
 
     public static AppConfiguration CreateDefault(string treasureChestRoot)
     {
-        var progressRoot = Path.Combine(treasureChestRoot, "components", "FeiShuBOT");
+        var progressRoot = Path.Combine(treasureChestRoot, "components", "codex-feishu");
         string Ps(string script) =>
             $"powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{Path.Combine(progressRoot, "scripts", script)}\" -ToolsRoot \"{Path.Combine(treasureChestRoot, "components")}\"";
 
@@ -22,6 +22,9 @@ public sealed class AppConfiguration
                 AutoStartEnabled = false,
                 StartMinimizedToTray = true,
                 RefreshIntervalSeconds = 5,
+                AutoCheckForUpdates = true,
+                UpdateCheckIntervalHours = 12,
+                ThemeMode = "day",
             },
             Sessions =
             [
@@ -65,6 +68,12 @@ public sealed class GeneralSettings
     public bool AutoStartEnabled { get; set; } = true;
     public bool StartMinimizedToTray { get; set; } = true;
     public int RefreshIntervalSeconds { get; set; } = 5;
+    public bool AutoCheckForUpdates { get; set; } = true;
+    public int UpdateCheckIntervalHours { get; set; } = 12;
+    public DateTimeOffset? LastUpdateCheckAt { get; set; }
+    public string UpdateCheckETag { get; set; } = string.Empty;
+    public string LastNotifiedUpdateVersion { get; set; } = string.Empty;
+    public string ThemeMode { get; set; } = "day";
 }
 
 public sealed class SessionDefinition

@@ -81,7 +81,7 @@ Desktop wait_threads ── waitingOnUserInput ───────────
 6. `message_id` 未在进程内重复；
 7. 文本正文非空。
 
-主服务再以 `reply_to_message_id` 查询本地出站分片映射，并核对通知编号签名、有效期、一次性消费状态和消息指纹。未引用本工具消息的普通私聊、其他用户、群聊、机器人消息、过期回复、重复回复、ID 与正文编号不一致的回复全部忽略，不自动回复。
+主服务再以 `reply_to_message_id` 查询本地出站分片映射，并核对通知编号签名、有效期和消息指纹。普通 turn 的父通知只负责稳定定位 Codex thread；每条入站飞书 `message_id` 在 `reply_deliveries` 中建立独立幂等子投递，因此同一父通知可以多轮引用、重复事件不会重放、同正文不同消息仍能分别追加。RPC、人工输入和 hook 等动作仍使用父通知的一次性消费状态。未引用本工具消息的普通私聊、其他用户、群聊、机器人消息和无效关联不会触发 Codex。
 
 绑定阶段使用同一个 WebSocket 机制但不设置白名单：仅在有限时间内接受“指定一次性代码 + p2p + 非机器人”的唯一消息，获得发送者 `ou_...` 后立即断开并写入 `target_open_id`。绑定不会按照昵称或备注猜测身份。
 
@@ -90,12 +90,16 @@ Desktop wait_threads ── waitingOnUserInput ───────────
 项目目录 `.state/progress-wx.sqlite` 由本服务管理，主要表为：
 
 - `hook_events`：Codex `notify` 原始 JSON 队列（内部兼容表名），按事件键去重；
-- `notifications`：通知编号、正文、Codex thread/turn、reply kind、过期时间、飞书 `message_id`、消费和投递状态；
+- `notifications`：父通知编号、正文、Codex thread/turn、reply kind、过期时间、飞书 `message_id`，以及一次性 RPC/hook 的消费状态；
+- `reply_deliveries`：普通 turn 回复的逐消息子投递、严格顺序、claim/delivered/discarded 与送达回执状态；
 - `notification_message_ids`：一个通知对应一个或多个飞书分片 `message_id` 的唯一映射；
 - `processed_turns`：已产生通知的轮次永久去重键，防止服务重启后重复汇报；
+- `thread_title_recoveries`：仅为确认缺失独立标题的历史异常保存按内容哈希版本化的恢复名；正常 Codex 标题始终优先，列表读取不触发模型；
 - `meta`：状态库 schema 版本。
 
-消息发送前先 `reserve_notification`，出站成功后一次性绑定全部 `message_id`，再标记 `sent`/`processed`。入站回复以带锁事务完成 `peek → consume`；相同消息在内存、SQLite 唯一索引和签名三层去重。schema 6 会无损迁移旧版单 `channel_message_id`，并用独立 `discarded_at` 记录经精确数量和年龄门槛确认丢弃的陈旧测试回复。首次生产启用还会先固定所选对话的当前终态快照，再原子核对并基线待处理 `notify` 数量；快照之后结束的新轮次仍正常通知。
+会话搜索的描述、证据与语义判断使用 `thread_id + content_hash` 精确版本键。写入新内容版本时保留旧版本，避免审计证据在同一次刷新中静默消失；旧版本仅由 90 天清理窗口回收。CLI 默认使用生产持久缓存；`--cache-mode ephemeral` 会先在线复制完整状态到临时 SQLite，只在副本中写入，供百宝箱/UI 验收复用相同搜索引擎而不改变生产状态。
+
+消息发送前先 `reserve_notification`，出站成功后一次性绑定全部 `message_id`，再标记 `sent`/`processed`。普通入站回复以带锁事务创建按父通知与入站 `message_id` 唯一的子投递；相同事件在进程内记忆、SQLite 唯一索引和签名三层去重。schema 13 会把旧版已经消费的 turn 状态逐条迁移成保留原 claim/delivered/discarded 事实的子投递；schema 14 新增标题异常恢复缓存。两项迁移都不批量重发、不丢失未知状态，也不修改 Codex 自己的数据库。首次生产启用还会先固定所选对话的当前终态快照，再原子核对并基线待处理 `notify` 数量；快照之后结束的新轮次仍正常通知。
 
 Codex 回复的顺序为：
 

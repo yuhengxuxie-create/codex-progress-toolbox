@@ -1,4 +1,5 @@
 using TreasureChest.Core.Services;
+using TreasureChest.Integrations;
 using TreasureChest.Services;
 using TreasureChest.UI;
 
@@ -26,6 +27,8 @@ internal static class Program
 
         Directory.CreateDirectory(Path.Combine(AppPaths.Root, "logs"));
         var logger = new AppLogger(AppPaths.LogFile);
+        if (!ShellIdentityService.TryInitializeCurrentProcess(out var shellIdentityResult))
+            logger.Error($"Shell 身份初始化失败：HRESULT 0x{shellIdentityResult:X8}");
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
         Application.ThreadException += (_, eventArgs) =>
         {
@@ -38,14 +41,19 @@ internal static class Program
         {
             var configStore = new ConfigStore(AppPaths.ConfigFile, AppPaths.Root);
             var config = configStore.LoadAsync().GetAwaiter().GetResult();
-            var autoStart = new AutoStartService();
+            UiTheme.Initialize(config.Settings.ThemeMode);
+            var sessionSearchCacheMode = SessionSearchExecutionPolicy.FromApplicationArguments(args);
+            var autoStart = new AutoStartService(
+                suppressWrites: SessionSearchExecutionPolicy.SuppressSystemStateWrites(args));
             if (string.Equals(Path.GetFileNameWithoutExtension(Environment.ProcessPath), "TreasureChest", StringComparison.OrdinalIgnoreCase))
                 autoStart.Apply(config.Settings.AutoStartEnabled);
-            var sessionManager = new SessionManager(logger);
+            var sessionManager = new SessionManager(logger,
+                new GuardianCliService(AppPaths.ProgressNotificationRoot, AppPaths.ProgressPythonPath));
             var pluginCatalog = new PluginCatalog(Path.Combine(AppPaths.Root, "plugins"));
             MainForm.ActivateMessage = activateMessage;
             using var form = new MainForm(config, configStore, logger, sessionManager, pluginCatalog, autoStart,
-                args.Any(value => value.Equals("--startup", StringComparison.OrdinalIgnoreCase)));
+                args.Any(value => value.Equals("--startup", StringComparison.OrdinalIgnoreCase)),
+                sessionSearchCacheMode);
             var shuttingDown = false;
             var activationThread = new Thread(() =>
             {
