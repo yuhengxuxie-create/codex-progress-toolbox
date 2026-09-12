@@ -6,6 +6,7 @@ Set-StrictMode -Version Latest
 $Root = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $Root).Path)
 . (Join-Path (Join-Path $Root 'installer') '_common.ps1')
 Assert-NoReparsePoints -Root $Root
+& (Join-Path $PSScriptRoot 'validate-launcher-bytes.ps1') -Root $Root
 
 $Required = @(
     'AGENTS.md', 'README.md', 'CHANGELOG.md', 'UPGRADE.md', 'SECURITY.md',

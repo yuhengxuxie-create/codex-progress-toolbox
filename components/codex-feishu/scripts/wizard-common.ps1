@@ -2,7 +2,7 @@
 
 function Get-WizardContext {
     [CmdletBinding()]
-    param([string]$ToolsRoot = (Split-Path -Parent $PSScriptRoot))
+    param([string]$ToolsRoot = $(if (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'Python313-ProgressWX\python.exe') -PathType Leaf) { Split-Path -Parent $PSScriptRoot } else { Split-Path -Parent (Split-Path -Parent $PSScriptRoot) }))
 
     $ResolvedToolsRoot = [IO.Path]::GetFullPath($ToolsRoot)
     if ([Uri]::new($ResolvedToolsRoot).IsUnc) {

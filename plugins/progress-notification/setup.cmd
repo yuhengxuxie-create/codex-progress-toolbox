@@ -6,7 +6,7 @@ for %%I in ("%~dp0..\..") do set "TREASURE_ROOT=%%~fI"
 set "COMPONENTS=%TREASURE_ROOT%\components"
 set "SETUP_SCRIPT=%COMPONENTS%\codex-feishu\scripts\one-click-feishu-setup.ps1"
 if not exist "%SETUP_SCRIPT%" (
-  echo 找不到首次设置脚本：%SETUP_SCRIPT%
+  echo "找不到首次设置脚本：%SETUP_SCRIPT%"
   echo 请重新运行 Release 包中的 installer\install.ps1。
   pause
   exit /b 2

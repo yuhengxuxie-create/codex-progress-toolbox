@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "progress-checking-wx"
-version = "1.6.0"
+version = "1.6.1"
 description = "Codex 对话进度的本地飞书通知与双向回复桥"
 readme = "README.md"
 requires-python = ">=3.11"

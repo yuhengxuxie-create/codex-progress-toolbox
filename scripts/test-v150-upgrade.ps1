@@ -71,7 +71,7 @@ if ($Progress.percent -ne 100 -or $Progress.state -ne 'completed') { throw 'Upda
 & $Python $Fixture check $InstallRoot
 if ($LASTEXITCODE -ne 0) { throw 'Migrated database check failed.' }
 $Metadata = Get-Content (Join-Path $InstallRoot '.ecosystem/installation.json') -Raw | ConvertFrom-Json
-if ($Metadata.service_started -or $Metadata.ecosystem_version -ne '1.6.0') { throw 'Unexpected service or version state.' }
+if ($Metadata.service_started -or $Metadata.ecosystem_version -ne (Get-Content (Join-Path $PackageRoot 'PACKAGE_VERSION.txt') -Raw).Trim()) { throw 'Unexpected service or version state.' }
 & (Join-Path $PackageRoot 'installer/rollback.ps1') -TransactionManifest $Metadata.transaction_manifest
 if ((Digest $InstallRoot) -ne $Before -or (Digest $TestCodexHome) -ne $CodexBefore) { throw 'Rollback is not byte-identical.' }
 Write-Host 'PASS actual v1.5.0 install -> upgrade with ProgressFile -> private data/schema/DPAPI/plugin checks -> byte-identical rollback'

@@ -62,6 +62,7 @@ function Write-InternalChecksums {
 function New-PackageTree {
     param([string]$Type, [string]$Destination)
     Copy-RepositorySnapshot -Destination $Destination
+    & (Join-Path $Destination 'scripts/validate-launcher-bytes.ps1') -Root $Destination
     New-Item -ItemType Directory -Force -Path (Join-Path $Destination 'payload\treasure-chest\resources'), (Join-Path $Destination 'payload\offline\wheels') | Out-Null
     Copy-Item -LiteralPath $TreasureChestExe -Destination (Join-Path $Destination 'payload\treasure-chest\TreasureChest.exe') -Force
     Copy-Item -LiteralPath $UpdaterExe -Destination (Join-Path $Destination 'payload\treasure-chest\Ecosystem.Updater.exe') -Force

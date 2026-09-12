@@ -1,6 +1,6 @@
 ﻿[CmdletBinding()]
 param(
-    [string]$ToolsRoot = (Split-Path -Parent $PSScriptRoot),
+    [string]$ToolsRoot = $(if (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'Python313-ProgressWX\python.exe') -PathType Leaf) { Split-Path -Parent $PSScriptRoot } else { Split-Path -Parent (Split-Path -Parent $PSScriptRoot) }),
     [int]$PerformanceSeconds = 15,
     [switch]$NoDialog,
     [switch]$IntegratedMode,
