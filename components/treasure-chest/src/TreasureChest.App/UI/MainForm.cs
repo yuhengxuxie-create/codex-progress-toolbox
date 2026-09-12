@@ -1000,6 +1000,8 @@ internal sealed class MainForm : Form, IExplicitAnimationPaintSource
         stack.Controls.Add(_updateStatusLabel);
         var updateActions = new FlowLayoutPanel { AutoSize = true, Margin = new Padding(0, 0, 0, 18) };
         updateActions.Controls.Add(_checkForUpdatesButton);
+        updateActions.Controls.Add(ActionButton("打开官方发布页", () =>
+            Process.Start(new ProcessStartInfo(EcosystemUpdateService.ManualReleasePage) { UseShellExecute = true })));
         stack.Controls.Add(updateActions);
         var actions = new FlowLayoutPanel { AutoSize = true };
         actions.Controls.Add(ActionButton("导出配置", ExportConfig));

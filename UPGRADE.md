@@ -40,3 +40,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\installer\rollback.ps1
 ## 更早版本
 
 GitHub v1.2.0 Webhook 模板只迁移通过格式检查的 monitor thread IDs，不复用 Webhook、签名或旧 config.local.json。2026-08-25 完整生态保留允许的配置与状态。旧 Webhook 用户需要创建企业自建应用。更早来源的兼容能力与本轮真实 v1.5.0 升级验收分别记录，不把一条路径的结果推广到所有版本。
+
+## 检查更新提示限流
+
+若旧版检查更新显示 `403 (rate limit exceeded)`，可从 [官方发布页](https://github.com/yuhengxuxie-create/codex-progress-toolbox/releases/latest) 下载当前已发布的升级包，解压到原安装目录之外，再运行新包的“快捷升级.cmd”。
+
+v1.6.2 会显示服务要求的等待时间，检查结果短时复用；等待期间重复点击不会提前请求。API 限流时会尝试官方发布清单，若仍不可用可点击“打开官方发布页”手动下载。

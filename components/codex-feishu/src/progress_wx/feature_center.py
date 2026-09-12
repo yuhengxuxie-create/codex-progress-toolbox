@@ -133,10 +133,10 @@ DEFAULT_FEATURE_SECTIONS: tuple[FeatureSection, ...] = (
     FeatureSection(
         key="codex",
         title="指令使用",
-        description="查看当前会话可用的 Skills 和斜杠指令；具体指令可直接输入。",
+        description="直接浏览个人/全局 Skills 和斜杠指令说明，无需先选择会话。",
         entries=(
-            _entry("codex_skills", "Skills", "查看当前会话可用的已启用 Skill。", "/skills"),
-            _entry("codex_slash", "斜杠指令", "查看并使用当前可用的官方斜杠指令。", "斜杠指令"),
+            _entry("codex_skills", "Skills", "查看已启用的个人/全局技能；浏览不执行。", "/skills"),
+            _entry("codex_slash", "斜杠指令", "直接查看指令用途、支持情况和使用方法。", "/commands"),
         ),
     ),
     FeatureSection(

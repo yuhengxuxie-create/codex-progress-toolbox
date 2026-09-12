@@ -6,12 +6,18 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 import hashlib
 import json
+import os
+from pathlib import Path
 import re
 import threading
 import unicodedata
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .codex_rpc import CodexAppServer, CodexRPCError
+
+
+class SkillsListError(CodexRPCError):
+    """A fixed, safe diagnosis; never contains raw provider text or paths."""
 
 
 REMOTE_CONTROL_ENTRY_COMMAND = "远程控制"
@@ -614,6 +620,7 @@ def build_skills_card(
     page: int = 1,
     page_size: int = 10,
     refreshed_at: str = "",
+    browse_only: bool = False,
 ) -> dict[str, Any]:
     if type(page) is not int or page < 1:
         raise ValueError("Skills 页码必须是正整数")
@@ -638,13 +645,16 @@ def build_skills_card(
         {
             "tag": "markdown",
             "content": (
-                f"当前工作目录可用 **{len(skills)}** 个已启用 Skills。\n"
-                f"第 {page}/{pages} 页｜本页 {len(options)} 个"
+                (f"个人/全局已启用 Skills：**{len(skills)}** 个（不含项目专属）。\n" if browse_only else f"当前工作目录可用 **{len(skills)}** 个已启用 Skills。\n")
+                + f"第 {page}/{pages} 页｜本页 {len(options)} 个"
                 + (f"\n刷新时间：{refreshed_at}" if refreshed_at else "")
             ),
         }
     ]
-    if options:
+    if options and browse_only:
+        for skill in visible:
+            elements.append({"tag": "markdown", "content": f"**{skill.display_name or skill.name}** (`{skill.name}`)\n{skill.description[:500]}"})
+    elif options:
         elements.append(
             {
                 "tag": "form",
@@ -662,7 +672,7 @@ def build_skills_card(
             }
         )
     else:
-        elements.append({"tag": "markdown", "content": "该会话当前没有已启用的 Skill。"})
+        elements.append({"tag": "markdown", "content": "此范围当前没有已启用的 Skill。"})
     navigation: list[Mapping[str, Any]] = []
     if page > 1:
         navigation.append(_button("上一页", f"skills_page:{page - 1}"))
@@ -684,7 +694,7 @@ def build_skills_card(
         }
     )
     elements.extend(text_instruction_blocks(['回复本卡片，任选一种写法：', '• /skill 技能名 请求', '• $技能名 请求'], legacy=False))
-    if options:
+    if options and not browse_only:
         legacy_elements: list[Mapping[str, Any]] = []
         for item in elements:
             if item.get("tag") == "markdown":
@@ -872,8 +882,8 @@ class PreparedRemoteSession(AbstractContextManager["PreparedRemoteSession"]):
             },
         }
 
-    def skills(self, *, force_reload: bool) -> tuple[SkillSnapshot, ...]:
-        cwd = self.cwd()
+    def skills(self, *, force_reload: bool, cwd: str | None = None, global_only: bool = False) -> tuple[SkillSnapshot, ...]:
+        cwd = self.cwd() if cwd is None else cwd
         result = self._result(
             self.rpc.request(
                 "skills/list",
@@ -882,21 +892,25 @@ class PreparedRemoteSession(AbstractContextManager["PreparedRemoteSession"]):
         )
         data = result.get("data")
         if not isinstance(data, list):
-            raise CodexRPCError("skills/list 响应缺少 data")
+            raise SkillsListError("官方 Skills 响应缺少列表数据。")
         matching = [
             entry
             for entry in data
-            if isinstance(entry, Mapping) and str(entry.get("cwd") or "") == cwd
+            if isinstance(entry, Mapping) and os.path.normcase(os.path.normpath(str(entry.get("cwd") or ""))) == os.path.normcase(os.path.normpath(cwd))
         ]
         if len(matching) != 1:
-            raise CodexRPCError("skills/list 未唯一返回目标工作目录")
+            raise SkillsListError("官方 Skills 响应未唯一匹配请求范围。")
+        if matching[0].get("errors"):
+            raise SkillsListError("Codex 报告技能加载错误，列表可能不完整；请在桌面端检查技能配置。")
         raw_skills = matching[0].get("skills")
         if not isinstance(raw_skills, list):
-            raise CodexRPCError("skills/list 响应缺少 skills")
+            raise SkillsListError("官方 Skills 响应缺少技能条目。")
         snapshots: list[SkillSnapshot] = []
         seen: set[str] = set()
         for raw in raw_skills:
             if not isinstance(raw, Mapping) or raw.get("enabled") is not True:
+                continue
+            if global_only and raw.get("scope") not in {"user", "system", "admin"}:
                 continue
             name = str(raw.get("name") or "").strip()
             path = str(raw.get("path") or raw.get("skillPath") or "").strip()
@@ -930,12 +944,17 @@ class PreparedRemoteSession(AbstractContextManager["PreparedRemoteSession"]):
             if isinstance(status_raw, Mapping)
             else str(status_raw or "")
         )
+        # New thread/read exposes persisted settings on thread; older builds
+        # used result-level fields. Explicit null remains unavailable.
+        fields = dict(result)
+        if isinstance(thread, Mapping):
+            fields.update(thread)
         return ThreadRuntimeSnapshot(
-            model=str(result.get("model") or "").strip(),
-            effort=str(result.get("reasoningEffort") or "").strip(),
+            model=str(fields.get("model") or "").strip(),
+            effort=str(fields.get("reasoningEffort") or "").strip(),
             service_tier=(
-                str(result.get("serviceTier")).strip()
-                if result.get("serviceTier") is not None
+                str(fields.get("serviceTier")).strip()
+                if fields.get("serviceTier") is not None
                 else None
             ),
             status=status,
@@ -1190,6 +1209,16 @@ class AppServerRemoteControl:
             raise ValueError("包含未知的远程写能力")
         self._write_capabilities = normalized
         self._operation_lock = threading.Lock()
+
+    def global_skills(self) -> tuple[SkillSnapshot, ...]:
+        """Read user/system/admin skills without selecting or loading a thread."""
+        rpc = self._rpc_factory()
+        try:
+            rpc.initialize()
+            reader = PreparedRemoteSession(rpc, "", frozenset(), lambda: None)
+            return reader.skills(force_reload=True, cwd=str(Path.home()), global_only=True)
+        finally:
+            rpc.close()
 
     def prepare(self, thread_id: str) -> PreparedRemoteSession:
         if type(thread_id) is not str or not thread_id.strip():

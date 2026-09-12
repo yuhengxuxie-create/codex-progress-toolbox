@@ -76,6 +76,7 @@ from .remote_control import (
     RemoteCommand,
     RemoteWriteUnavailable,
     SkillSnapshot,
+    SkillsListError,
     build_goal_set_form_card,
     build_goal_clear_confirmation_card,
     build_plan_start_form_card,
@@ -1033,6 +1034,10 @@ class CodexManagementController:
             )
             return
         slash = parse_slash_command(command)
+        browse = parse_remote_command(command)
+        if browse is not None and browse.kind == "skills_list":
+            self._global_skills_list(message, browse)
+            return
         if slash is not None and slash.kind in {"catalog", "catalog_page"}:
             page = int(slash.argument or "1")
             self._respond_card(
@@ -1638,7 +1643,7 @@ class CodexManagementController:
             content = raw_content.rstrip()
         else:
             content = raw_content.strip()
-        if kind == "feature_center":
+        if kind in {"feature_center", "skills_catalog"}:
             # Feishu 已把严格 action 映射成真实文字命令；这里复用唯一顶层控制器。
             self._handle_top(message, contextual=True)
         elif kind == "current_binding":
@@ -3407,6 +3412,33 @@ class CodexManagementController:
             f"management-remote-goal-get:{message.message_id}",
         )
 
+    def _global_skills_list(self, message: ChannelReply, command: RemoteCommand) -> None:
+        if self.remote_control is None:
+            raise ManagementUserError("当前未启用本机 Codex Skills 读取连接。")
+        try:
+            skills = self.remote_control.global_skills()
+        except CodexRPCRejected as exc:
+            raise ManagementUserError("读取 Skills 被官方接口拒绝。\n" + exc.safe_detail) from exc
+        except SkillsListError as exc:
+            raise ManagementUserError(str(exc)) from exc
+        except CodexRPCError as exc:
+            raise ManagementUserError("暂时无法读取本机 Skills；连接发现或技能加载未通过检查，没有执行技能或改变会话。") from exc
+        page = int(command.argument or "1")
+        pages = max(1, math.ceil(len(skills) / 10))
+        if page > pages:
+            raise ManagementUserError(f"当前 Skills 只有 {pages} 页，请重新打开列表。")
+        visible = skills[(page - 1) * 10:page * 10]
+        lines = [f"个人/全局 Skills：{len(skills)} 个｜第 {page}/{pages} 页",
+                 "包含当前用户、系统和管理配置中的已启用技能；不包含项目专属技能。"]
+        lines.extend(f"- {item.name}：{_compact(item.description, 160)}" for item in visible)
+        if not skills:
+            lines.append("官方目录当前没有返回此范围内的已启用技能。")
+        lines.append("浏览不会执行技能；提交技能和具体要求后再关联目标会话。")
+        self._respond_card(build_skills_card("个人/全局 Skills（不含项目专属）", skills, page=page, browse_only=True),
+                           "skills_catalog", {"page": page},
+                           f"management-global-skills:{message.message_id}:{page}",
+                           fallback_text="\n".join(lines))
+
     def _remote_skills_list(
         self,
         context_id: str,
@@ -3633,6 +3665,7 @@ class CodexManagementController:
             )
             raise ManagementUserError(
                 "Codex 官方接口明确拒绝了这次操作；没有把它当作成功。"
+                + "\n" + exc.safe_detail
             ) from exc
         except (CodexRPCClosed, CodexRPCTimeout, CodexRPCError, StateError) as exc:
             if submitted:
@@ -3888,6 +3921,7 @@ class CodexManagementController:
             )
             raise ManagementUserError(
                 "Codex 官方接口明确拒绝了这次操作；没有把它当作成功。"
+                + "\n" + exc.safe_detail
             ) from exc
         except (CodexRPCClosed, CodexRPCTimeout, CodexRPCError, StateError) as exc:
             if submitted:

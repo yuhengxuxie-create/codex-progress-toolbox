@@ -99,7 +99,7 @@ public static class EcosystemVersion
     public static string Display(Version version) => $"v{version.Major}.{version.Minor}.{Math.Max(0, version.Build)}";
 }
 
-public sealed class EcosystemUpdateService : IDisposable
+public sealed partial class EcosystemUpdateService : IDisposable
 {
     public const string RepositoryWebRoot = "https://github.com/yuhengxuxie-create/codex-progress-toolbox";
     private static readonly Uri LatestReleaseApi = new(
@@ -107,7 +107,8 @@ public sealed class EcosystemUpdateService : IDisposable
     private readonly HttpClient _httpClient;
     private readonly bool _ownsClient;
 
-    public EcosystemUpdateService(HttpClient? httpClient = null)
+    public EcosystemUpdateService(HttpClient? httpClient = null, string? checkStatePath = null,
+        Func<DateTimeOffset>? utcNow = null)
     {
         _ownsClient = httpClient is null;
         _httpClient = httpClient ?? new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
@@ -115,9 +116,12 @@ public sealed class EcosystemUpdateService : IDisposable
             _httpClient.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("TreasureChest", "1.0"));
         _httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
         _httpClient.DefaultRequestHeaders.Add("X-GitHub-Api-Version", "2022-11-28");
+        _utcNow = utcNow ?? (() => DateTimeOffset.UtcNow);
+        _checkStatePath = checkStatePath ?? (httpClient is null ? Path.Combine(GetCacheRoot(), "check-state.json") : null);
+        LoadCheckState();
     }
 
-    public async Task<UpdateCheckResult> CheckAsync(
+    private async Task<UpdateCheckResult> CheckCoreAsync(
         Version currentVersion,
         string? etag = null,
         CancellationToken cancellationToken = default)
@@ -130,6 +134,7 @@ public sealed class EcosystemUpdateService : IDisposable
         var responseEtag = response.Headers.ETag?.ToString() ?? etag ?? string.Empty;
         if (response.StatusCode == HttpStatusCode.NotModified)
             return new UpdateCheckResult(true, false, responseEtag, null);
+        await ThrowIfRateLimitedAsync(response, cancellationToken).ConfigureAwait(false);
         response.EnsureSuccessStatusCode();
         await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
         var release = await JsonSerializer.DeserializeAsync<GitHubRelease>(stream, JsonOptions, cancellationToken)

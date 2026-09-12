@@ -80,6 +80,7 @@ var root = Path.Combine(Path.GetTempPath(), "TreasureChest-SelfTest-" + Guid.New
 Directory.CreateDirectory(root);
 try
 {
+    await Check("更新限流退避与官方清单安全", () => UpdateRateLimitRegression.VerifyAsync(root, Assert));
     await Check("更新异常分支保留材料且不自动启动", async () =>
     {
         foreach (var reason in new[] { "父进程等待失败", "校验失败", "回滚失败", "回滚结果未知" })

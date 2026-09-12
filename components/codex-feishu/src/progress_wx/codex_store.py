@@ -319,6 +319,8 @@ def prompt_derived_thread_title(value: object, record: ThreadRecord) -> bool:
     title = _title_comparison_text(value)
     if not title:
         return False
+    if record.title_source == "session_index_name" and _as_text(value) == record.title:
+        return False
     explicit_name = _title_comparison_text(record.raw.get("name"))
     if explicit_name and title == explicit_name:
         return False
@@ -339,9 +341,15 @@ def independent_thread_title(
     explicit_name = _as_text(record.raw.get("name"))
     # 本地结构化生命周期已经按 manual > SQLite > session_index 解析；调用方
     # 提供的 Desktop 快照只用于本地尚无独立标题时补位，不能反向覆盖新值。
-    for candidate in (explicit_name, record.title, *preferred_titles):
+    for candidate in (explicit_name, record.title):
         title = _as_text(candidate)
         if title and not prompt_derived_thread_title(title, record):
+            return title
+    # Callers provide only structured Desktop list_threads title/name fields,
+    # never summaries, search snippets or raw prompt text inferred as a name.
+    for candidate in preferred_titles:
+        title = _as_text(candidate)
+        if title:
             return title
     return ""
 
@@ -365,6 +373,10 @@ def _resolve_thread_title(
         return explicit_name, "manual_name"
     if raw_title and not _title_is_preview_derived(raw_title, raw_preview):
         return raw_title, "sqlite_title"
+    # An explicitly indexed name equal to a request is still a name.
+    # Do not infer the same provenance for an unindexed SQLite preview.
+    if indexed_title and indexed_title == raw_preview:
+        return indexed_title, "session_index_name"
     if indexed_title and not _title_is_preview_derived(indexed_title, raw_preview):
         return indexed_title, "session_index_title"
     if indexed_title:

@@ -17,6 +17,7 @@ import time
 import uuid
 from ctypes import wintypes
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
@@ -79,6 +80,32 @@ if os.name == "nt":
 
 
 class _WindowsFramePipe:
+    def server_identity(self) -> tuple[int, float]:
+        """Kernel identity of this live verified pipe's server process."""
+        kernel = self._kernel32
+        kernel.GetNamedPipeServerProcessId.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.ULONG)]
+        kernel.GetNamedPipeServerProcessId.restype = wintypes.BOOL
+        pid = wintypes.ULONG()
+        if self._handle is None or not kernel.GetNamedPipeServerProcessId(self._handle, ctypes.byref(pid)):
+            raise DesktopAppToolsUnavailable("无法核验当前管道所属进程")
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        process = kernel.OpenProcess(0x1000, False, pid.value)
+        if not process:
+            raise DesktopAppToolsUnavailable("无法核验当前管道进程创建时间")
+        try:
+            times = [wintypes.FILETIME() for _ in range(4)]
+            kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+            kernel.GetProcessTimes.restype = wintypes.BOOL
+            if not kernel.GetProcessTimes(process, *[ctypes.byref(t) for t in times]):
+                raise DesktopAppToolsUnavailable("无法读取当前管道进程创建时间")
+            if times[1].dwLowDateTime or times[1].dwHighDateTime:
+                raise DesktopAppToolsUnavailable("管道所属进程已退出")
+            ticks = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+            return pid.value, ticks / 10_000_000 - 11644473600
+        finally:
+            kernel.CloseHandle(process)
+
     """使用 Windows Overlapped I/O 实现带硬超时的长度前缀 JSON 帧。"""
 
     _GENERIC_READ = 0x80000000
@@ -644,6 +671,46 @@ class DesktopAppToolsClient:
         session = self.open_verified(required_tools=("list_threads",))
         try:
             pipe_path = session.source_pipe_path
+            # Startup pipe lines can rotate away. The same live pipe handle's
+            # kernel PID and creation time identify its current log generation.
+            identity_reader = getattr(session.pipe, "server_identity", None)
+            if identity_reader is not None:
+                identity = identity_reader()
+                pid, born = identity
+                candidates: set[str] = set()
+                files = self.log_dir.glob(f"**/codex-desktop-*-{pid}-t0-*.log")
+                total_bytes = 0
+                for file_index, path in enumerate(files):
+                    if file_index >= 128:
+                        raise DesktopAppToolsUnavailable("当前进程日志超过身份核验文件上限")
+                    consumed = 0
+                    try:
+                        with path.open("r", encoding="utf-8", errors="replace") as handle:
+                            for line in handle:
+                                consumed += len(line.encode("utf-8", errors="replace"))
+                                total_bytes += len(line.encode("utf-8", errors="replace"))
+                                if total_bytes > 64 * 1024 * 1024:
+                                    raise DesktopAppToolsUnavailable("当前进程日志超过身份核验读取上限")
+                                if consumed > _MAX_RUNTIME_LOG_BYTES:
+                                    raise DesktopAppToolsUnavailable("单份当前进程日志超过身份核验读取上限")
+                                cli_match = _CODEX_CLI_LINE.search(line)
+                                if not cli_match or cli_match.group("source") != "bundled-or-dev":
+                                    continue
+                                try:
+                                    stamp = datetime.fromisoformat(line.split()[0].replace("Z", "+00:00"))
+                                    if stamp.tzinfo is None or stamp.timestamp() < born:
+                                        continue
+                                except (ValueError, IndexError):
+                                    continue
+                                candidates.add(cli_match.group("path"))
+                    except OSError:
+                        continue
+                if identity_reader() != identity:
+                    raise DesktopAppToolsUnavailable("管道进程身份在读取期间发生变化")
+                if len(candidates) > 1:
+                    raise DesktopAppToolsUnavailable("当前管道进程报告多个 CLI，无法唯一确认")
+                if candidates:
+                    return candidates.pop()
         finally:
             session.close()
         if not pipe_path:

@@ -2866,7 +2866,7 @@ def test_search_display_uses_generated_title_for_prompt_metadata_and_keeps_expli
             {
                 "id": "thread-prompt-derived",
                 "kind": "codex",
-                "title": prompt_excerpt,
+                "title": "",
             },
             {
                 "id": "thread-explicit-path",

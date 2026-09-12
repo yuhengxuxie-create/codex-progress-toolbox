@@ -38,7 +38,22 @@ class CodexRPCError(RuntimeError):
 
 
 class CodexRPCRejected(CodexRPCError):
-    """App Server 已明确返回 JSON-RPC error。"""
+    """App Server 已明确返回 JSON-RPC error；不保留原始错误正文。"""
+
+    def __init__(self, message: str, *, error: object = None) -> None:
+        super().__init__(message)
+        code = error.get("code") if isinstance(error, Mapping) else None
+        self.code = code if type(code) is int else None
+
+    @property
+    def safe_detail(self) -> str:
+        category = {
+            -32601: "当前接口不支持该方法",
+            -32602: "接口拒绝了请求参数",
+            -32600: "接口拒绝了请求格式",
+            -32603: "官方服务内部错误",
+        }.get(self.code, "官方接口返回错误")
+        return category + (f"（JSON-RPC {self.code}）" if self.code is not None else "")
 
 
 class CodexRPCTimeout(CodexRPCError):
@@ -814,7 +829,7 @@ class CodexAppServer:
                         error = item.get("error")
                         if error is not None:
                             raise CodexRPCRejected(
-                                f"Codex App Server {method} 返回 JSON-RPC error"
+                                f"Codex App Server {method} 返回 JSON-RPC error", error=error
                             )
                         return item
 
@@ -847,7 +862,7 @@ class CodexAppServer:
                     error = item.get("error")
                     if error is not None:
                         raise CodexRPCRejected(
-                            f"Codex App Server {method} 返回 JSON-RPC error"
+                            f"Codex App Server {method} 返回 JSON-RPC error", error=error
                         )
                     return item
             finally:
