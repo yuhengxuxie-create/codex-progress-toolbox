@@ -29,6 +29,6 @@
 - [通信守护与 Windows 自动恢复](docs/WINDOWS_GUARDIAN_RECOVERY.md)
 - [安全说明](SECURITY.md)
 
-源码位于 components/codex-feishu 和 components/treasure-chest；installer 包含安装和回滚脚本，scripts 包含构建与验证工具。公开包不包含生产配置、凭据、数据库、日志或用户内容。自动测试不等于真实飞书手机界面和账号授权验收。
+源码位于 components/codex-feishu 和 components/treasure-chest；installer 包含安装和回滚脚本，scripts 包含构建与验证工具。公开包不包含生产配置、凭据、数据库、日志或用户内容。安装后请完成自己的飞书应用配置和用户绑定，并确认消息能够正常收发。
 
 许可证：[MIT](LICENSE)。
