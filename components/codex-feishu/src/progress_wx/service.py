@@ -5022,7 +5022,11 @@ class ProgressService:
     def _poll_once(self, config: AppConfig) -> None:
         timing = _PollCycleTiming()
         try:
-            self._poll_once_measured(config, timing)
+            if isinstance(self.codex_store, CodexStore):
+                with self.codex_store.metadata_batch():
+                    self._poll_once_measured(config, timing)
+            else:
+                self._poll_once_measured(config, timing)
         finally:
             timing.finish()
 

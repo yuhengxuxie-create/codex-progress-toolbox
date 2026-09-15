@@ -1,4 +1,4 @@
-# Codex Feishu Ecosystem 1.6.2 安装指令
+# Codex Feishu Ecosystem 1.6.3 安装指令
 
 ## 目标
 
@@ -108,6 +108,6 @@ powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File .\installer\upgr
 若用户还没创建或发布应用，应报告“基础安装完成，等待用户创建自己的飞书机器人”，不要描述为程序故障。
 
 
-## 1.6.2 升级设置
+## 1.6.3 升级设置
 
-本目录对应正式版本 v1.6.2。v1.5.0 首次升级请使用 UPGRADE.md 的专用脚本，不要求旧版内置更新按钮。原应用与绑定保留；必须阅读 docs/FEISHU_UPGRADE_PERMISSIONS.md，按需补卡片回调 card.action.trigger 和菜单事件 application.bot.menu_v6。不要把权限 scope 未新增理解为无需检查平台配置。
+本目录对应正式版本 v1.6.3。v1.5.0 首次升级请使用 UPGRADE.md 的专用脚本，不要求旧版内置更新按钮。原应用与绑定保留；必须阅读 docs/FEISHU_UPGRADE_PERMISSIONS.md，按需补卡片回调 card.action.trigger 和菜单事件 application.bot.menu_v6。不要把权限 scope 未新增理解为无需检查平台配置。

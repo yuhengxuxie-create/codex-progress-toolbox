@@ -194,17 +194,35 @@ class Guardian:
 
     def _record_worker_error(self, code, worker, now):
         generation = worker['generation']
-        with self.store.lock, self.store.db:
-            context = self._worker_error_origin(generation)
-            if context is None or context['code'] != code:
-                key = _WORKER_ERRORS[code] + ':' + generation
-                if self.store.outcome('system:' + key) is not None:
-                    key += ':' + uuid.uuid4().hex
-                context = {'code': code, 'generation': generation, 'notice_key': key, 'started_at': now}
-            values = {'last_error_code': code, 'worker_error_context': context}
-            self.store.db.executemany('INSERT OR REPLACE INTO control VALUES(?,?)',
-                [(key, json.dumps(value)) for key, value in values.items()])
-        return context['notice_key']
+        with self.store.lock:
+            self.store.db.execute('BEGIN IMMEDIATE')
+            try:
+                current = self.store.get('worker', {})
+                if (self.store.get('desired_state') != 'running'
+                    or current.get('generation') != generation or not _alive(current)):
+                    return None
+                stale = (current.get('ready') and now-current.get('heartbeat_at', now)>30
+                         if code == 'worker_unresponsive' else
+                         not current.get('ready') and now-current.get('started_at',now)>90)
+                if not stale:
+                    return None
+                context = self._worker_error_origin(generation)
+                if context is None or context['code'] != code:
+                    key = _WORKER_ERRORS[code] + ':' + generation
+                    if self.store.outcome('system:' + key) is not None:
+                        key += ':' + uuid.uuid4().hex
+                    context = {'code': code, 'generation': generation, 'notice_key': key, 'started_at': now}
+                values = {'last_error_code': code, 'worker_error_context': context,
+                          'worker_error_recovery': None}
+                self.store.db.executemany('INSERT OR REPLACE INTO control VALUES(?,?)',
+                    [(key, json.dumps(value)) for key, value in values.items()])
+                return context['notice_key']
+            except BaseException:
+                self.store.db.rollback()
+                raise
+            finally:
+                if self.store.db.in_transaction:
+                    self.store.db.commit()
 
     def _recover_worker_error(self, worker, now):
         # Re-read under the same transaction so an external stop/new intent
@@ -218,6 +236,8 @@ class Guardian:
                     or current.get('generation') != generation or not _alive(current)
                     or not current.get('ready') or not -10 <= now-current.get('heartbeat_at', 0) <= 30
                     or not self.store.get('channel', {}).get('online')):
+                    self.store.db.execute('INSERT OR REPLACE INTO control VALUES(?,?)',
+                        ('worker_error_recovery', 'null'))
                     return
                 origin = self._worker_error_origin(generation)
                 if origin is None:
@@ -230,6 +250,25 @@ class Guardian:
                             origin = None
                 if origin is None:
                     return
+                # One fresh sample does not close a fault episode. Require
+                # 60 seconds continuously healthy and at least 3 advancing
+                # business heartbeats. Persist progress across guardian restarts.
+                recovery = self.store.get('worker_error_recovery') or {}
+                heartbeat = current.get('heartbeat_at', 0)
+                identity = (origin['notice_key'], generation, self.store.get('intent_at'))
+                if (tuple(recovery.get('identity', ())) != identity
+                    or not 0 <= now-recovery.get('last_seen', 0) <= 30
+                    or heartbeat < recovery.get('heartbeat', 0)):
+                    recovery = {'identity': identity, 'started_at': now,
+                                'heartbeat': heartbeat, 'samples': 1}
+                elif heartbeat > recovery.get('heartbeat', 0):
+                    recovery['samples'] += 1
+                    recovery['heartbeat'] = heartbeat
+                recovery['last_seen'] = now
+                self.store.db.execute('INSERT OR REPLACE INTO control VALUES(?,?)',
+                    ('worker_error_recovery', json.dumps(recovery)))
+                if now-recovery['started_at'] < 60 or recovery['samples'] < 3:
+                    return
                 history = self.store.get('worker_error_history', [])
                 history = [*history[-31:], {**origin, 'recovered_at': now, 'recovered_generation': generation}]
                 # Preserve the fault row, but do not deliver a still-unsubmitted
@@ -238,7 +277,8 @@ class Guardian:
                 self.store.db.execute("UPDATE outgoing SET state='superseded',error='worker_recovered',updated=? WHERE key=? AND state IN ('pending','cancelled')",
                     (now, 'system:'+origin['notice_key']))
                 values = {'last_error_code': None, 'worker_error_context': None,
-                          'worker_error_replacement': None, 'worker_error_history': history}
+                          'worker_error_replacement': None, 'worker_error_history': history,
+                          'worker_error_recovery': None}
                 self.store.db.executemany('INSERT OR REPLACE INTO control VALUES(?,?)',
                     [(key, json.dumps(value)) for key, value in values.items()])
             except BaseException:
@@ -350,6 +390,19 @@ class Guardian:
                     self.store.finish(key,'superseded',error='connection_restored')
                     continue
                 payload = json.loads(row['payload'])
+                if key.startswith(('system:hung:', 'system:startup-timeout:')):
+                    current = self.store.get('worker', {})
+                    origin = self._worker_error_origin(current.get('generation'))
+                    if origin is None or 'system:'+origin['notice_key'] != key:
+                        self.store.finish(key, 'superseded', error='worker_fault_no_longer_current')
+                        continue
+                    now = time.time()
+                    stale = (current.get('ready') and now-current.get('heartbeat_at',now)>30
+                             if key.startswith('system:hung:') else
+                             not current.get('ready') and now-current.get('started_at',now)>90)
+                    if self.store.get('desired_state') != 'running' or not _alive(current) or not stale:
+                        self.store.finish(key, 'pending', error='waiting_for_current_worker_fault')
+                        continue
                 if 'blob_ref' in payload:
                     reference=payload.pop('blob_ref')
                     blob_name=reference.get('name')
@@ -422,6 +475,8 @@ class Guardian:
         worker = self.store.get('worker',{})
         alive = _alive(worker)
         intent_at = self.store.get('intent_at',0)
+        if not (alive and worker.get('ready') and -10 <= now-worker.get('heartbeat_at',0) <= 30 and online):
+            self.store.put('worker_error_recovery', None)
         if desired == 'running':
             if alive:
                 if worker.get('ready') and -10 <= now-worker.get('heartbeat_at',0) <= 30 and online:
@@ -431,11 +486,11 @@ class Guardian:
                     notice = self._record_worker_error('worker_unresponsive', worker, now)
                     # An older release may already own this key with its old
                     # wording. Never change its digest or resend that event.
-                    if self.store.outcome('system:'+notice) is None:
+                    if notice and self.store.outcome('system:'+notice) is None:
                         self.system(notice,'飞书机器人业务状态更新超时，暂无法确认响应；原任务状态已保留，需要在本机核查。')
                 elif not worker.get('ready') and now-worker.get('started_at',now)>90:
                     notice = self._record_worker_error('worker_initialization_timeout', worker, now)
-                    if self.store.outcome('system:'+notice) is None:
+                    if notice and self.store.outcome('system:'+notice) is None:
                         self.system(notice,'飞书机器人业务服务初始化超时，尚未就绪；原任务状态已保留，需要在本机核查。')
             elif worker.get('state') in {'starting','ready'}:
                 if worker.get('state') == 'starting' and now-worker.get('started_at',0)<90 and not worker.get('pid'):

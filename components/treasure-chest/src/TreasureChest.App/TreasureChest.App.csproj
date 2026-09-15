@@ -9,10 +9,10 @@
     <ApplicationIcon>..\..\resources\app.ico</ApplicationIcon>
     <AssemblyName>TreasureChest</AssemblyName>
     <RootNamespace>TreasureChest</RootNamespace>
-    <Version>1.6.2</Version>
-    <AssemblyVersion>1.6.2.0</AssemblyVersion>
-    <FileVersion>1.6.2.0</FileVersion>
-    <InformationalVersion>1.6.2</InformationalVersion>
+    <Version>1.6.3</Version>
+    <AssemblyVersion>1.6.3.0</AssemblyVersion>
+    <FileVersion>1.6.3.0</FileVersion>
+    <InformationalVersion>1.6.3</InformationalVersion>
     <Product>Codex Feishu Ecosystem - TreasureChest</Product>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>true</SelfContained>

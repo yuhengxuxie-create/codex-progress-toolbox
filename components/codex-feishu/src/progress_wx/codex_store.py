@@ -10,6 +10,7 @@ id、标题和工作目录的精确相等。由于 Codex 的内部 schema 可能
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -660,7 +661,33 @@ class CodexStore:
                     break
         return selected, mapping
 
-    def _read_threads(
+    @contextmanager
+    def metadata_batch(self):
+        """Reuse directory reads within one poll, never turns or rollout data."""
+        previous = getattr(self._query_state, 'metadata_batch', None)
+        self._query_state.metadata_batch = {}
+        try:
+            yield
+        finally:
+            self._query_state.metadata_batch = previous
+
+    def _read_threads(self, *, prepare_rollout_ownership: bool = True):
+        cache = getattr(self._query_state, 'metadata_batch', None)
+        if cache is None:
+            return self._read_threads_uncached(prepare_rollout_ownership=prepare_rollout_ownership)
+        key = bool(prepare_rollout_ownership)
+        if key not in cache:
+            before = len(self._errors())
+            records, available = self._read_threads_uncached(prepare_rollout_ownership=key)
+            cache[key] = (records, available, tuple(self._errors()[before:]),
+                          frozenset(getattr(self._query_state, 'shared_rollout_paths', set())))
+            return list(records), available
+        records, available, errors, shared = cache[key]
+        self._errors().extend(errors)
+        self._query_state.shared_rollout_paths = set(shared)
+        return list(records), available
+
+    def _read_threads_uncached(
         self, *, prepare_rollout_ownership: bool = True
     ) -> tuple[list[ThreadRecord], bool]:
         connection = self._open(self.paths.state_db, "state")

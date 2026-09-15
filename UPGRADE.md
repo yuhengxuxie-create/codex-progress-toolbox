@@ -46,3 +46,7 @@ GitHub v1.2.0 Webhook 模板只迁移通过格式检查的 monitor thread IDs，
 若旧版检查更新显示 `403 (rate limit exceeded)`，可从 [官方发布页](https://github.com/yuhengxuxie-create/codex-progress-toolbox/releases/latest) 下载当前已发布的升级包，解压到原安装目录之外，再运行新包的“快捷升级.cmd”。
 
 v1.6.2 会显示服务要求的等待时间，检查结果短时复用；等待期间重复点击不会提前请求。API 限流时会尝试官方发布清单，若仍不可用可点击“打开官方发布页”手动下载。
+
+## v1.6.3 业务超时告警修复
+
+本版保留原配置、绑定和用户数据，无需新增权限或重新配对。将升级包解压到原安装目录之外，运行“快捷升级.cmd”并选择原安装目录。

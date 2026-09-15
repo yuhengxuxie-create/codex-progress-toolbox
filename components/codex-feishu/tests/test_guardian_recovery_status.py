@@ -3,6 +3,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from unittest.mock import patch
 
 from progress_wx.guardian import Guardian, guardian_status
 from progress_wx.process_control import process_creation_time
@@ -12,6 +13,16 @@ from test_guardian import FakeChannel, config
 def worker(generation='same', age=0, ready=True):
     return dict(generation=generation, pid=os.getpid(), creation_time=process_creation_time(os.getpid()),
                 heartbeat_at=time.time()-age, started_at=time.time()-120, ready=ready, state='ready' if ready else 'starting')
+
+
+def stable_recovery(g, current=None):
+    """Recovery now requires continuous progress, not one fresh sample."""
+    record = dict(current or worker())
+    start = time.time()
+    for offset in (0,20,40,60):
+        with patch('progress_wx.guardian.time.time', return_value=start+offset):
+            record['heartbeat_at'] = start+offset
+            g.store.put('worker', dict(record));g.tick()
 
 
 @pytest.mark.parametrize('ready,age,error,prefix', [
@@ -26,7 +37,7 @@ def test_same_generation_real_recovery_clears_active_error_preserves_history(tmp
         assert g.store.get('last_error_code')==error
         fault_key='system:'+prefix+':same'
         before=dict(g.store.db.execute('SELECT * FROM outgoing WHERE key=?',(fault_key,)).fetchone())
-        g.store.put('worker',worker());g.tick()
+        stable_recovery(g)
         assert g.store.get('last_error_code') is None
         after=dict(g.store.db.execute('SELECT * FROM outgoing WHERE key=?',(fault_key,)).fetchone())
         assert after['state']=='superseded' and after['error']=='worker_recovered'
@@ -62,7 +73,7 @@ def test_old_control_data_requires_matching_persisted_fault_receipt(tmp_path):
         g.tick();assert g.store.get('last_error_code')=='worker_unresponsive'
         g.system('hung:other','synthetic fault');g.tick()
         assert g.store.get('last_error_code')=='worker_unresponsive'
-        g.system('hung:same','synthetic fault');g.tick()
+        g.system('hung:same','synthetic fault');stable_recovery(g)
         assert g.store.get('last_error_code') is None
     finally:g.store.close()
 
@@ -87,6 +98,7 @@ def test_replacement_only_clears_old_fault_after_proven_new_launch(tmp_path,lega
         if proof=='offline':ch.online=False
         if proof=='other-error':g.store.put('last_error_code','other-error')
         g.store.put('worker',current);g.tick()
+        if proof=='valid':stable_recovery(g,current)
         expected=None if proof=='valid' else 'other-error' if proof=='other-error' else 'worker_unresponsive'
         assert g.store.get('last_error_code')==expected
         if proof=='valid':
@@ -99,7 +111,7 @@ def test_replacement_only_clears_old_fault_after_proven_new_launch(tmp_path,lega
 def test_persisted_timeout_episode_survives_guardian_reopen_without_duplicate(tmp_path):
     g=Guardian(config(tmp_path),FakeChannel())
     g.store.intent('running');g.store.put('worker',worker(age=40));g.tick()
-    g.store.put('worker',worker());g.tick()
+    stable_recovery(g)
     g.store.put('worker',worker(age=40));g.tick()
     notice=g.store.get('worker_error_context')['notice_key']
     assert notice!='hung:same'
@@ -119,7 +131,7 @@ def test_recovery_preserves_already_submitted_fault_outcome(tmp_path,state):
         g.store.intent('running');g.store.put('worker',worker(age=40));g.tick()
         with g.store.db:g.store.db.execute('UPDATE outgoing SET state=? WHERE key=?',(state,'system:hung:same'))
         before=dict(g.store.db.execute('SELECT * FROM outgoing WHERE key=?',('system:hung:same',)).fetchone())
-        g.store.put('worker',worker());g.tick()
+        stable_recovery(g)
         assert g.store.get('last_error_code') is None
         assert dict(g.store.db.execute('SELECT * FROM outgoing WHERE key=?',('system:hung:same',)).fetchone())==before
     finally:g.store.close()
